@@ -1,0 +1,9 @@
+{
+  "name": "codec-agent-runtime-mvp0",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test --experimental-strip-types tests/*.test.ts"
+  }
+}
