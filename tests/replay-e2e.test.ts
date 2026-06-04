@@ -74,4 +74,8 @@ test("E2E vertical slice edits a workspace file and replays ordered causal event
   ]);
   assert.equal(replay.hasPermissionForEveryToolCall, true);
   assert.equal(replay.toolResultsInjectedBeforeNextModelCall, true);
+  assert.equal(replay.inspectedToolCalls.read.injection.status, "ok");
+  assert.match(replay.inspectedToolCalls.read.injection.observationHash, /^[a-f0-9]{64}$/);
+  assert.equal(typeof replay.inspectedToolCalls.read.injection.summary, "string");
+  assert.equal(replay.inspectedToolCalls.search.finished.metadataHash.length, 64);
 });

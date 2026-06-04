@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -92,4 +92,51 @@ test("ToolExecutor normalizes read/search/edit/shell results", async () => {
   assert.equal(shell.ok, true);
   assert.equal(shell.output.exitCode, 0);
   assert.match(shell.output.stdout, /^v/);
+});
+
+test("ToolExecutor redacts secrets from read_file and shell outputs", async () => {
+  const cwd = await workspace();
+  await writeFile(join(cwd, ".env"), "OPENAI_API_KEY=sk-secret-123\nTOKEN=abc123\n");
+  const tools = new ToolExecutor({ timeoutMs: 5000 });
+
+  const read = await tools.execute({ id: "read", name: "read_file", input: { path: ".env" } }, { cwd });
+  assert.equal(read.ok, true);
+  assert.doesNotMatch(read.output.text, /sk-secret-123/);
+  assert.match(read.output.text, /\[REDACTED/);
+  assert.equal(read.metadata.redacted, true);
+
+  const shell = await tools.execute(
+    { id: "shell", name: "shell", input: { command: 'node -e "console.log(`sk-secret-123`)"' } },
+    { cwd },
+  );
+  assert.equal(shell.ok, true);
+  assert.doesNotMatch(shell.output.stdout, /sk-secret-123/);
+  assert.match(shell.output.stdout, /\[REDACTED/);
+  assert.equal(shell.metadata.redacted, true);
+});
+
+test("search_text skips ignored directories and large files within a bounded scan budget", async () => {
+  const cwd = await workspace();
+  await mkdir(join(cwd, "node_modules"), { recursive: true });
+  await mkdir(join(cwd, ".git"), { recursive: true });
+  await writeFile(join(cwd, "notes.txt"), "needle in workspace\n");
+  await writeFile(join(cwd, "big.log"), "x".repeat(300_000), "utf8");
+  await writeFile(join(cwd, ".gitignore"), "needle in root\n", "utf8");
+  await writeFile(join(cwd, "node_modules", "lib.js"), "needle hidden\n", "utf8");
+  await writeFile(join(cwd, ".git", "config"), "needle hidden too\n", "utf8");
+
+  const tools = new ToolExecutor({ maxSearchMatches: 10, maxSearchFiles: 10, maxFileBytes: 32_000 });
+  const search = await tools.execute(
+    { id: "search", name: "search_text", input: { pattern: "needle", path: "." } },
+    { cwd },
+  );
+
+  assert.equal(search.ok, true);
+  assert.deepEqual(
+    search.output.matches.map((match) => match.path).sort(),
+    [".gitignore", "notes.txt"],
+  );
+  assert.equal(search.metadata.skippedLargeFiles, 1);
+  assert.equal(search.metadata.scannedFiles, 3);
+  assert.equal(search.metadata.budgetExceeded, false);
 });
