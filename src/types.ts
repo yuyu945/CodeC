@@ -113,6 +113,41 @@ export interface InstructionBundle {
   trimmedSources: string[];
 }
 
+export type MemoryScope = "project" | "reference";
+
+export type MemoryConfidence = "low" | "medium" | "high";
+
+export type MemoryFreshness = "fresh" | "aging" | "stale";
+
+export type MemoryLoadPolicy = "project_entry" | "on_demand" | "always" | "search_only";
+
+export interface MemoryRecord {
+  id: string;
+  scope: MemoryScope;
+  content: string;
+  sourceEventIds: string[];
+  confidence: MemoryConfidence;
+  freshness: MemoryFreshness;
+  loadPolicy: MemoryLoadPolicy;
+  tags?: string[];
+  expiresAt?: string;
+  conflictsWith?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+export interface MemoryQuery {
+  scope?: MemoryScope;
+  text?: string;
+  tags?: string[];
+  sourceEventIds?: string[];
+}
+
+export interface MemoryManager {
+  write(record: MemoryRecord): Promise<MemoryRecord>;
+  retrieve(query: MemoryQuery): Promise<MemoryRecord[]>;
+  list(): Promise<MemoryRecord[]>;
+}
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

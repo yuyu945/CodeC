@@ -12,13 +12,15 @@ The project now has a stable runtime core with:
 - project-scoped instruction resolution
 - micro-compact for historical tool results
 - local observability derived from existing `AgentEvent`
+- memory manager foundation for explicit project/reference records
 
 Current repository state:
 
 - the runtime is test-driven and runnable through the local test harness
-- context, instruction, replay, retry, redaction, and local inspection behavior are implemented
+- context, instruction, replay, retry, redaction, local inspection, and memory foundation behavior are implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
+- memory remains explicit-write-only and does not auto-persist during normal turns
 
 ## Completed
 
@@ -85,7 +87,11 @@ Delivered:
 
 ### Phase 4: Provider Parity
 
-Delivered in the working tree:
+Completed in commit:
+
+- `9a658ad feat: add anthropic parity and local observability`
+
+Delivered:
 
 - `AnthropicAdapter`
 - Anthropic request/response mapping
@@ -96,7 +102,11 @@ Delivered in the working tree:
 
 ### Phase 5: Local Observability
 
-Delivered in the working tree:
+Completed in commit:
+
+- `9a658ad feat: add anthropic parity and local observability`
+
+Delivered:
 
 - `eventCoverageChecklist`
 - `SessionSummary`
@@ -111,6 +121,31 @@ Observability scope:
 - redacted by default
 - no exporter / dashboard / telemetry backend
 
+### Phase 6: Memory Manager Foundation
+
+Delivered in the working tree:
+
+- `MemoryRecord`
+- `MemoryQuery`
+- `MemoryManager`
+- `FileMemoryStore`
+- `LocalMemoryManager`
+- explicit project/reference memory scope classification
+- write-time redaction enforcement
+- explicit-write-only durable memory behavior
+
+Memory scope:
+
+- `project`
+- `reference`
+
+Memory constraints:
+
+- no automatic writes from normal runtime turns
+- no Auto Dream
+- no semantic retrieval
+- no user/feedback/episodic memory yet
+
 ## Current Test Surface
 
 Test files:
@@ -123,6 +158,7 @@ Test files:
 - `tests/instructions.test.ts`
 - `tests/module-exports.test.ts`
 - `tests/observability.test.ts`
+- `tests/memory.test.ts`
 
 Covered behavior:
 
@@ -137,31 +173,32 @@ Covered behavior:
 - instruction resolution and trimming
 - micro-compact behavior
 - local observability summaries and metrics
+- explicit durable memory storage and retrieval
 
 Current verification status:
 
-- full suite passes locally: `44/44`
+- full suite passes locally: `50/50`
 
 ## Next Recommended Milestone
 
 The next two realistic phases are:
 
-1. `Memory Manager`
-   - project/reference memory boundary
-   - durable memory record model
-   - provenance and write policy
+1. `Memory Integration`
+   - explicit caller-selected memory injection into context
+   - optional suggested writes without automatic persistence
    - no Auto Dream yet
 
-2. `Commit current provider + observability work`
-   - commit Anthropic parity
-   - commit local observability
-   - keep design docs untracked unless explicitly requested
+2. `Memory Maintenance Groundwork`
+   - conflict detection
+   - freshness/aging mechanics
+   - still no background Auto Dream executor
 
 Do not start MCP, multi-agent, or product surfaces before one of those is stabilized.
 
 ## Known Constraints
 
 - Event storage remains local JSONL.
+- Memory storage is local JSONL/file-backed and separate from event storage.
 - There is still no product surface such as CLI/TUI/API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
