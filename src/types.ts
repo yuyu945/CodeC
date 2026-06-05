@@ -9,6 +9,7 @@ export interface TurnRequest {
   sessionId: string;
   userMessage: string;
   workspace: WorkspacePolicy;
+  memorySelections?: MemoryContextSelection[];
   abortSignal?: AbortSignal;
 }
 
@@ -42,6 +43,7 @@ export interface ToolResult<T = unknown> {
 export interface ModelResponse {
   finalMessage?: string;
   toolCalls?: ToolCall[];
+  memorySuggestions?: MemoryWriteSuggestion[];
 }
 
 export interface ModelRequest {
@@ -88,7 +90,7 @@ export interface ContextFragment {
   pinned: boolean;
   discardable: boolean;
   source: "system" | "user" | "tool";
-  summaryKind: "instructions" | "workspace" | "task" | "observation" | "summary";
+  summaryKind: "instructions" | "workspace" | "task" | "observation" | "memory" | "summary";
 }
 
 export interface InstructionSource {
@@ -146,6 +148,39 @@ export interface MemoryManager {
   write(record: MemoryRecord): Promise<MemoryRecord>;
   retrieve(query: MemoryQuery): Promise<MemoryRecord[]>;
   list(): Promise<MemoryRecord[]>;
+}
+
+export interface RedactedMemoryRecord {
+  id: string;
+  scope: MemoryScope;
+  content: string;
+  confidence: MemoryConfidence;
+  freshness: MemoryFreshness;
+  loadPolicy: MemoryLoadPolicy;
+  tags?: string[];
+}
+
+export interface MemoryContextSelection {
+  manager: MemoryManager;
+  query: MemoryQuery;
+  maxRecords?: number;
+}
+
+export interface MemoryContextPayload {
+  type: "memory_context";
+  records: RedactedMemoryRecord[];
+  selectedCount: number;
+  truncated: boolean;
+}
+
+export interface MemoryWriteSuggestion {
+  scope: MemoryScope;
+  content: string;
+  confidence: MemoryConfidence;
+  freshness: MemoryFreshness;
+  loadPolicy: MemoryLoadPolicy;
+  tags?: string[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface ContextBundle {
@@ -240,4 +275,5 @@ export interface TurnResult {
     decision: PermissionDecision;
   };
   events: AgentEvent[];
+  memorySuggestions?: MemoryWriteSuggestion[];
 }

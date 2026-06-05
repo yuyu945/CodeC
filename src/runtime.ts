@@ -38,6 +38,7 @@ export class AgentRuntime {
   }
 
   async runTurn(request: TurnRequest): Promise<TurnResult> {
+    const memorySuggestions: TurnResult["memorySuggestions"] = [];
     if (request.abortSignal?.aborted) {
       await this.deps.eventStore.append({ type: "UserMessage", sessionId: request.sessionId, text: request.userMessage });
       await this.deps.eventStore.append({
@@ -50,6 +51,7 @@ export class AgentRuntime {
         finalMessage: `Stopped: aborted. ${abortReason(request.abortSignal.reason)}`,
         finishReason: "aborted",
         events: await this.deps.eventStore.forSession(request.sessionId),
+        memorySuggestions,
       };
     }
 
@@ -106,6 +108,7 @@ export class AgentRuntime {
             finalMessage: `Stopped: aborted. ${abortReason(request.abortSignal.reason)}`,
             finishReason: "aborted",
             events: await this.deps.eventStore.forSession(request.sessionId),
+            memorySuggestions,
           };
         }
 
@@ -118,6 +121,7 @@ export class AgentRuntime {
 
         try {
           response = await this.deps.model.complete(context);
+          memorySuggestions.push(...(response.memorySuggestions ?? []));
           finalProviderError = undefined;
           break;
         } catch (error) {
@@ -154,6 +158,7 @@ export class AgentRuntime {
           finalMessage: `Stopped: model error (${finalProviderError.code}). ${redactProviderMessage(finalProviderError.message)}`,
           finishReason: "model_error",
           events: await this.deps.eventStore.forSession(request.sessionId),
+          memorySuggestions,
         };
       }
 
@@ -170,6 +175,7 @@ export class AgentRuntime {
           finalMessage: response.finalMessage,
           finishReason: "final_message",
           events: await this.deps.eventStore.forSession(request.sessionId),
+          memorySuggestions,
         };
       }
 
@@ -214,6 +220,7 @@ export class AgentRuntime {
             finalMessage: "",
             nextAction: { type: "approval_required", call, decision },
             events: await this.deps.eventStore.forSession(request.sessionId),
+            memorySuggestions,
           };
         }
 
@@ -261,6 +268,7 @@ export class AgentRuntime {
       finalMessage: "Stopped: tool iteration limit reached.",
       finishReason: "tool_iteration_limit",
       events: await this.deps.eventStore.forSession(request.sessionId),
+      memorySuggestions,
     };
   }
 

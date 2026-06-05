@@ -7,6 +7,9 @@ import type {
   ContextFragment,
   HistoricalToolResultPlaceholder,
   InstructionBundle,
+  MemoryContextPayload,
+  MemoryContextSelection,
+  RedactedMemoryRecord,
   ToolCall,
   ToolObservation,
   ToolResult,
@@ -26,6 +29,7 @@ export class ContextBuilder {
 
   async build(request: TurnRequest): Promise<ContextBundle> {
     const observations = this.observations.get(request.sessionId) ?? [];
+    const memoryContext = await buildMemoryContext(request.memorySelections ?? []);
     const instructionBundle = this.instructionResolver
       ? await this.instructionResolver.resolve({
           workspaceRoot: request.workspace.root ?? request.workspace.cwd,
@@ -40,7 +44,13 @@ export class ContextBuilder {
       ),
       createFragment(
         "system",
-        ["no memory", "no multi-agent", "no retrieval", "no IDE/TUI/API surface"],
+        [
+          "no automatic memory persistence",
+          "memory retrieval only when explicitly selected by caller",
+          "no non-memory retrieval surface",
+          "no multi-agent",
+          "no IDE/TUI/API surface",
+        ],
         95,
         true,
         false,
@@ -48,6 +58,9 @@ export class ContextBuilder {
         "workspace",
       ),
       createFragment("system", { workspace: request.workspace.cwd }, 40, false, true, "system", "workspace"),
+      ...(memoryContext.records.length > 0
+        ? [createFragment("system", memoryContext, 70, false, true, "system", "memory")]
+        : []),
       createFragment("user", request.userMessage, 90, true, false, "user", "task"),
       ...observations.map((observation) => createFragment("tool", observation, 50, false, true, "tool", "observation")),
     ];
@@ -296,6 +309,7 @@ function summarizeFragment(fragment: ContextFragment): string {
   if (fragment.summaryKind === "task") return summarizeTask(fragment.content);
   if (fragment.summaryKind === "workspace") return `workspace:${shortSummary(fragment.content, 24)}`;
   if (fragment.summaryKind === "observation") return `observation:${shortSummary(fragment.content, 32)}`;
+  if (fragment.summaryKind === "memory") return `memory:${shortSummary(fragment.content, 32)}`;
   return `summary:${shortSummary(fragment.content, 32)}`;
 }
 
@@ -348,4 +362,43 @@ function createPlaceholder(observation: ToolObservation): HistoricalToolResultPl
     originalSize: serializedSize(observation),
     summaryLabel: `previous_${observation.toolName}_result`,
   };
+}
+
+async function buildMemoryContext(selections: MemoryContextSelection[]): Promise<MemoryContextPayload> {
+  const records: RedactedMemoryRecord[] = [];
+  const seenIds = new Set<string>();
+  let truncated = false;
+
+  for (const selection of selections) {
+    const limit = normalizeMemoryLimit(selection.maxRecords);
+    const retrieved = await selection.manager.retrieve(selection.query);
+    if (retrieved.length > limit) truncated = true;
+    for (const record of retrieved.slice(0, limit)) {
+      if (seenIds.has(record.id)) continue;
+      seenIds.add(record.id);
+      const redacted = redactSecretsInString(record.content);
+      records.push({
+        id: record.id,
+        scope: record.scope,
+        content: redacted.text,
+        confidence: record.confidence,
+        freshness: record.freshness,
+        loadPolicy: record.loadPolicy,
+        tags: record.tags,
+      });
+    }
+  }
+
+  return {
+    type: "memory_context",
+    records,
+    selectedCount: records.length,
+    truncated,
+  };
+}
+
+function normalizeMemoryLimit(maxRecords: number | undefined): number {
+  if (maxRecords === undefined) return 8;
+  if (!Number.isFinite(maxRecords)) return 8;
+  return Math.max(0, Math.floor(maxRecords));
 }

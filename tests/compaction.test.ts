@@ -8,11 +8,14 @@ import {
   AgentRuntime,
   ContextBuilder,
   FakeModelAdapter,
+  FileMemoryStore,
   JsonlEventStore,
+  LocalMemoryManager,
   PermissionManager,
   ProviderError,
   Replay,
   ToolExecutor,
+  type MemoryRecord,
   createOpenAIResponsesAdapter,
 } from "../src/index.ts";
 
@@ -339,4 +342,56 @@ test("MicroCompact uses structured placeholders instead of free-text summaries",
   assert.equal(typeof placeholder?.output?.originalSize, "number");
   assert.equal(typeof placeholder?.output?.summaryLabel, "string");
   assert.equal(String(placeholder?.output?.summaryLabel).startsWith("previous_"), true);
+});
+
+function memoryRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
+  return {
+    id: "mem-compact-1",
+    scope: "project",
+    content: "Memory should summarize with a memory prefix during compaction",
+    sourceEventIds: ["evt-compact-1"],
+    confidence: "high",
+    freshness: "fresh",
+    loadPolicy: "project_entry",
+    ...overrides,
+  };
+}
+
+test("Context compaction summarizes memory fragments with a stable memory prefix", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(memoryRecord());
+
+  const builder = new ContextBuilder();
+  const context = await builder.build({
+    sessionId: "memory-auto-compact",
+    userMessage: "use memory",
+    workspace: { cwd },
+    memorySelections: [{ manager, query: { scope: "project" } }],
+  });
+
+  const result = builder.compact(context, "auto_compact");
+  const memorySummary = result.context.fragments.find((fragment) => fragment.summaryKind === "summary" && typeof fragment.content === "string" && fragment.content.startsWith("memory:"));
+  assert.ok(memorySummary);
+});
+
+test("Snip can discard memory fragments without dropping pinned system constraints", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(memoryRecord({ id: "mem-snip-1" }));
+
+  const builder = new ContextBuilder();
+  const context = await builder.build({
+    sessionId: "memory-snip",
+    userMessage: "use memory",
+    workspace: { cwd },
+    memorySelections: [{ manager, query: { scope: "project" } }],
+  });
+
+  assert.equal(context.fragments.some((fragment) => fragment.summaryKind === "memory"), true);
+  const result = builder.compact(context, "snip");
+
+  assert.equal(result.context.fragments.some((fragment) => fragment.summaryKind === "memory"), false);
+  assert.equal(result.context.fragments.some((fragment) => fragment.role === "system" && fragment.pinned), true);
+  assert.equal(result.discardedClasses.includes("memory"), true);
 });

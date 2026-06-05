@@ -13,14 +13,16 @@ The project now has a stable runtime core with:
 - micro-compact for historical tool results
 - local observability derived from existing `AgentEvent`
 - memory manager foundation for explicit project/reference records
+- explicit caller-selected memory context integration
 
 Current repository state:
 
 - the runtime is test-driven and runnable through the local test harness
 - context, instruction, replay, retry, redaction, local inspection, and memory foundation behavior are implemented
+- explicit memory injection and non-persistent memory suggestions are implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
-- memory remains explicit-write-only and does not auto-persist during normal turns
+- memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
 
 ## Completed
 
@@ -123,7 +125,11 @@ Observability scope:
 
 ### Phase 6: Memory Manager Foundation
 
-Delivered in the working tree:
+Completed in commit:
+
+- `c700757 feat: add explicit memory manager foundation`
+
+Delivered:
 
 - `MemoryRecord`
 - `MemoryQuery`
@@ -145,6 +151,25 @@ Memory constraints:
 - no Auto Dream
 - no semantic retrieval
 - no user/feedback/episodic memory yet
+
+### Phase 7: Memory Integration
+
+Delivered in the working tree:
+
+- `TurnRequest.memorySelections`
+- aggregate `memory_context` system fragment injection
+- per-selection memory retrieval limits with deterministic truncation
+- cross-selection memory record deduplication
+- injected memory redaction
+- non-persistent `memorySuggestions` returned from runtime turns
+- memory compaction summaries with stable `memory:` prefix
+
+Memory integration constraints:
+
+- memory retrieval occurs only when explicitly selected by the caller
+- memory suggestions are returned to the caller but are not written automatically
+- provider adapters do not parse provider-native responses into memory suggestions
+- memory context is one aggregate fragment, not one fragment per selection
 
 ## Current Test Surface
 
@@ -174,26 +199,23 @@ Covered behavior:
 - micro-compact behavior
 - local observability summaries and metrics
 - explicit durable memory storage and retrieval
+- explicit memory context injection
+- non-persistent runtime memory suggestions
 
 Current verification status:
 
-- full suite passes locally: `50/50`
+- full suite passes locally: `60/60`
 
 ## Next Recommended Milestone
 
-The next two realistic phases are:
+The next realistic phase is:
 
-1. `Memory Integration`
-   - explicit caller-selected memory injection into context
-   - optional suggested writes without automatic persistence
-   - no Auto Dream yet
-
-2. `Memory Maintenance Groundwork`
+1. `Memory Maintenance Groundwork`
    - conflict detection
    - freshness/aging mechanics
    - still no background Auto Dream executor
 
-Do not start MCP, multi-agent, or product surfaces before one of those is stabilized.
+Do not start MCP, multi-agent, or product surfaces before memory maintenance groundwork is stabilized.
 
 ## Known Constraints
 
@@ -202,3 +224,4 @@ Do not start MCP, multi-agent, or product surfaces before one of those is stabil
 - There is still no product surface such as CLI/TUI/API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
+- Memory suggestions remain non-persistent caller-facing outputs.
