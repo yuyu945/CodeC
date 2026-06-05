@@ -7,16 +7,18 @@ Last updated: 2026-06-05
 The project now has a stable runtime core with:
 
 - MVP-0 single-agent runtime loop
-- provider boundary with a real OpenAI Responses adapter
+- provider boundary with real OpenAI and Anthropic adapters
 - context compaction foundation
 - project-scoped instruction resolution
 - micro-compact for historical tool results
+- local observability derived from existing `AgentEvent`
 
 Current repository state:
 
 - the runtime is test-driven and runnable through the local test harness
-- context, instruction, replay, retry, and redaction behavior are implemented
-- Anthropic provider support is not implemented yet
+- context, instruction, replay, retry, redaction, and local inspection behavior are implemented
+- provider parity across fake, OpenAI, and Anthropic is implemented
+- observability remains local-only and derived from existing events
 
 ## Completed
 
@@ -65,7 +67,9 @@ Delivered:
 
 ### Phase 3: Context Pipeline
 
-This phase is complete in the working tree and ready to be committed as one capability boundary.
+Completed in commit:
+
+- `774c7c9 feat: finalize context pipeline and instruction system`
 
 Delivered:
 
@@ -79,11 +83,33 @@ Delivered:
 - instruction and compaction replay visibility
 - tool-output redaction and stronger replay inspection
 
-Why this is one coherent milestone:
+### Phase 4: Provider Parity
 
-- all changes are inside the same context-processing path
-- compaction, instructions, and micro-compact now share the same runtime/context/replay flow
-- no experimental-only logic remains outside the tested runtime path
+Delivered in the working tree:
+
+- `AnthropicAdapter`
+- Anthropic request/response mapping
+- Anthropic tool-call normalization
+- Anthropic error taxonomy mapping
+- Anthropic budget estimation
+- shared adapter contract validation across fake, OpenAI, and Anthropic
+
+### Phase 5: Local Observability
+
+Delivered in the working tree:
+
+- `eventCoverageChecklist`
+- `SessionSummary`
+- `SessionMetrics`
+- `SessionInspector`
+- local JSON report generation
+
+Observability scope:
+
+- derived from existing `AgentEvent`
+- local-only
+- redacted by default
+- no exporter / dashboard / telemetry backend
 
 ## Current Test Surface
 
@@ -96,6 +122,7 @@ Test files:
 - `tests/compaction.test.ts`
 - `tests/instructions.test.ts`
 - `tests/module-exports.test.ts`
+- `tests/observability.test.ts`
 
 Covered behavior:
 
@@ -103,33 +130,38 @@ Covered behavior:
 - permission decisions
 - tool execution
 - provider mapping
+- cross-provider adapter contract parity
 - provider retry and abort
 - replay inspection
 - compaction tiers
 - instruction resolution and trimming
 - micro-compact behavior
+- local observability summaries and metrics
 
 Current verification status:
 
-- full suite passes locally: `34/34`
+- full suite passes locally: `44/44`
 
 ## Next Recommended Milestone
 
-Add provider parity with an Anthropic adapter.
+The next two realistic phases are:
 
-Scope for the next phase:
+1. `Memory Manager`
+   - project/reference memory boundary
+   - durable memory record model
+   - provenance and write policy
+   - no Auto Dream yet
 
-- Anthropic adapter under the existing canonical `ModelAdapter` contract
-- Anthropic request/response mapping
-- Anthropic tool-call normalization
-- Anthropic error taxonomy mapping
-- Anthropic budget estimation
-- shared adapter contract validation across fake, OpenAI, and Anthropic
+2. `Commit current provider + observability work`
+   - commit Anthropic parity
+   - commit local observability
+   - keep design docs untracked unless explicitly requested
 
-Do not start memory manager, MCP, observability expansion, or product surfaces before Anthropic parity is complete.
+Do not start MCP, multi-agent, or product surfaces before one of those is stabilized.
 
 ## Known Constraints
 
 - Event storage remains local JSONL.
 - There is still no product surface such as CLI/TUI/API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
+- Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.

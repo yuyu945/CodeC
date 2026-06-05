@@ -147,7 +147,18 @@ export interface OpenAIModelAdapterConfig {
   compactThreshold?: number;
 }
 
-export type ModelAdapterConfig = FakeModelAdapterConfig | OpenAIModelAdapterConfig;
+export interface AnthropicModelAdapterConfig {
+  provider: "anthropic";
+  model: string;
+  apiKey?: string;
+  apiKeyEnvVar?: string;
+  baseUrl?: string;
+  contextWindow?: number;
+  compactThreshold?: number;
+  maxTokens?: number;
+}
+
+export type ModelAdapterConfig = FakeModelAdapterConfig | OpenAIModelAdapterConfig | AnthropicModelAdapterConfig;
 
 export type PermissionDecision =
   | { kind: "allow"; reason: string; snapshot: Record<string, unknown> }
