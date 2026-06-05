@@ -1,5 +1,6 @@
 export * from "./types.ts";
 export * from "./models.ts";
+export * from "./instructions.ts";
 export * from "./events.ts";
 export * from "./context.ts";
 export * from "./permissions.ts";

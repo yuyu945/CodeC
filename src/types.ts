@@ -2,6 +2,7 @@ export type ToolName = "read_file" | "search_text" | "edit_file" | "shell";
 
 export interface WorkspacePolicy {
   cwd: string;
+  root?: string;
 }
 
 export interface TurnRequest {
@@ -11,7 +12,7 @@ export interface TurnRequest {
   abortSignal?: AbortSignal;
 }
 
-export type CompactionTier = "none" | "auto_compact" | "reactive_compact" | "snip";
+export type CompactionTier = "none" | "micro_compact" | "auto_compact" | "reactive_compact" | "snip";
 
 export interface ContextBudgetReport {
   estimatedUnits: number;
@@ -65,6 +66,14 @@ export interface ToolObservation {
   metadata: Record<string, unknown>;
 }
 
+export interface HistoricalToolResultPlaceholder {
+  replacementKind: "historical_tool_result_placeholder";
+  toolName: string;
+  originalHash: string;
+  originalSize: number;
+  summaryLabel: string;
+}
+
 export interface ToolDefinition {
   name: ToolName;
   description: string;
@@ -82,11 +91,34 @@ export interface ContextFragment {
   summaryKind: "instructions" | "workspace" | "task" | "observation" | "summary";
 }
 
+export interface InstructionSource {
+  absolutePath: string;
+  relativePath: string;
+  scopeDepth: number;
+  byteSize: number;
+  rawText: string;
+  normalizedText: string;
+}
+
+export interface InstructionFragment extends InstructionSource {
+  priority: number;
+  pinned: boolean;
+}
+
+export interface InstructionBundle {
+  fragments: InstructionFragment[];
+  sources: InstructionSource[];
+  totalBytes: number;
+  trimmed: boolean;
+  trimmedSources: string[];
+}
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];
   fragments: ContextFragment[];
   toolDefinitions: ToolDefinition[];
+  instructions: InstructionBundle;
   budgetReport: ContextBudgetReport;
 }
 
@@ -132,6 +164,8 @@ type AgentEventBase = {
 export type AgentEvent =
   | (AgentEventBase & { type: "UserMessage"; text: string })
   | (AgentEventBase & { type: "ContextBuilt"; messageCount: number; toolCount: number })
+  | (AgentEventBase & { type: "InstructionsResolved"; appliedSources: string[]; totalBytes: number })
+  | (AgentEventBase & { type: "InstructionsTrimmed"; trimmedSources: string[]; totalBytes: number })
   | (AgentEventBase & {
       type: "ContextCompacted";
       tier: Exclude<CompactionTier, "none">;

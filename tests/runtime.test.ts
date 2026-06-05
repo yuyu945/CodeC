@@ -73,6 +73,7 @@ test("runTurn alternates model, tool, typed observation, and final message", asy
     [
       "UserMessage",
       "ContextBuilt",
+      "InstructionsResolved",
       "ModelRequestStarted",
       "ModelResponseReceived",
       "PermissionEvaluated",

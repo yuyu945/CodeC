@@ -1,3 +1,5 @@
+import { resolve } from "node:path";
+
 import { ContextBuilder } from "./context.ts";
 import { JsonlEventStore } from "./events.ts";
 import { ProviderError, redactProviderMessage } from "./models.ts";
@@ -52,17 +54,37 @@ export class AgentRuntime {
     }
 
     await this.deps.eventStore.append({ type: "UserMessage", sessionId: request.sessionId, text: request.userMessage });
-    let context = this.deps.contextBuilder.build(request);
+    let context = await this.deps.contextBuilder.build(request);
     await this.deps.eventStore.append({
       type: "ContextBuilt",
       sessionId: request.sessionId,
       messageCount: context.messages.length,
       toolCount: context.toolDefinitions.length,
     });
+    await this.deps.eventStore.append({
+      type: "InstructionsResolved",
+      sessionId: request.sessionId,
+      appliedSources: context.instructions.sources.map((source) => source.relativePath),
+      totalBytes: context.instructions.totalBytes,
+    });
+    if (context.instructions.trimmed) {
+      await this.deps.eventStore.append({
+        type: "InstructionsTrimmed",
+        sessionId: request.sessionId,
+        trimmedSources: context.instructions.trimmedSources,
+        totalBytes: context.instructions.totalBytes,
+      });
+    }
     context = this.refreshBudget(context);
 
     for (let iteration = 0; iteration < this.maxToolIterations; iteration++) {
-      if (context.budgetReport.mustCompact) {
+      let microCompactedThisIteration = false;
+      if (this.deps.contextBuilder.shouldMicroCompact(context)) {
+        context = await this.compactContext(context, request, "micro_compact");
+        microCompactedThisIteration = true;
+      }
+
+      if (!microCompactedThisIteration && context.budgetReport.mustCompact) {
         context = await this.compactContext(context, request, "auto_compact");
       }
 
@@ -203,6 +225,10 @@ export class AgentRuntime {
           inputHash: hashJson(call.input),
         });
         const result = await this.deps.toolExecutor.execute(call, request.workspace);
+        this.deps.contextBuilder.recordTouchedPaths(
+          request.sessionId,
+          extractTouchedPaths(result).map((path) => resolve(request.workspace.cwd, path)),
+        );
         await this.deps.eventStore.append({
           type: "ToolCallFinished",
           sessionId: request.sessionId,
@@ -318,4 +344,16 @@ function fallbackBudgetEstimate(context: ContextBundle): ContextBudgetReport {
     tier: context.budgetReport.tier ?? "none",
     overflowBy: estimatedUnits > limit ? estimatedUnits - limit : 0,
   };
+}
+
+function extractTouchedPaths(result: { output?: unknown }): string[] {
+  const output = result.output;
+  if (!output || typeof output !== "object") return [];
+  const directPath = typeof (output as { path?: unknown }).path === "string" ? String((output as { path: string }).path) : undefined;
+  const matches = Array.isArray((output as { matches?: unknown[] }).matches)
+    ? (output as { matches: Array<{ path?: unknown }> }).matches
+        .map((match) => (typeof match.path === "string" ? match.path : undefined))
+        .filter((path): path is string => Boolean(path))
+    : [];
+  return [...new Set([...(directPath ? [directPath] : []), ...matches])];
 }

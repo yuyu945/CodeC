@@ -186,3 +186,157 @@ test("AgentRuntime falls through to snip and records dropped fragment classes", 
   assert.equal(replay.compactions.some((event) => event.tier === "snip"), true);
   assert.equal(replay.compactions.some((event) => event.discardedClasses.length > 0), true);
 });
+
+test("MicroCompact preserves the most recent 3 tool-result observations by injection order", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  const observedPlaceholders: Array<unknown> = [];
+
+  const runtime = new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      model: "deterministic",
+      contextWindow: 220,
+      compactThreshold: 180,
+      responder: async (request, invocation) => {
+        if (invocation <= 5) {
+          return {
+            toolCalls: [
+              {
+                id: `shell-${invocation}`,
+                name: "shell",
+                input: { command: `node -e "console.log('${"x".repeat(220)}')"` },
+              },
+            ],
+          };
+        }
+        const toolMessages = request.messages.filter((message) => message.role === "tool");
+        observedPlaceholders.push(...toolMessages.map((message) => message.content));
+        return { finalMessage: "micro compacted" };
+      },
+    }),
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 8 },
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "micro-recent-3",
+    userMessage: "generate many shell results",
+    workspace: { cwd },
+  });
+
+  assert.equal(result.finalMessage, "micro compacted");
+  const placeholders = observedPlaceholders.filter(
+    (content) => content && typeof content === "object" && content.output && typeof content.output === "object" && content.output.replacementKind === "historical_tool_result_placeholder",
+  );
+  assert.equal(placeholders.length >= 1, true);
+
+  const replay = Replay.fromEvents(await eventStore.forSession("micro-recent-3"));
+  assert.equal(replay.compactions.some((event) => event.tier === "micro_compact"), true);
+});
+
+test("MicroCompact never replaces read_file observations but may still compact shell history", async () => {
+  const cwd = await workspace();
+  await writeFile(join(cwd, "notes.txt"), "read me\n".repeat(120));
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  const seenToolContents: Array<unknown> = [];
+
+  const runtime = new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      model: "deterministic",
+      contextWindow: 260,
+      compactThreshold: 220,
+      responder: async (request, invocation) => {
+        if (invocation === 1) {
+          return { toolCalls: [{ id: "read-1", name: "read_file", input: { path: "notes.txt" } }] };
+        }
+        if (invocation <= 5) {
+          return {
+            toolCalls: [
+              {
+                id: `shell-${invocation}`,
+                name: "shell",
+                input: { command: `node -e "console.log('${"y".repeat(220)}')"` },
+              },
+            ],
+          };
+        }
+        seenToolContents.push(...request.messages.filter((message) => message.role === "tool").map((message) => message.content));
+        return { finalMessage: "done" };
+      },
+    }),
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 8 },
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "micro-read-file",
+    userMessage: "read then shell repeatedly",
+    workspace: { cwd },
+  });
+
+  assert.equal(result.finalMessage, "done");
+  const readObservation = seenToolContents.find(
+    (content) => content && typeof content === "object" && content.toolName === "read_file",
+  );
+  assert.equal(readObservation?.output?.replacementKind, undefined);
+  const shellPlaceholder = seenToolContents.find(
+    (content) => content && typeof content === "object" && content.output?.replacementKind === "historical_tool_result_placeholder" && content.toolName === "shell",
+  );
+  assert.equal(Boolean(shellPlaceholder), true);
+});
+
+test("MicroCompact uses structured placeholders instead of free-text summaries", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  let finalToolMessages: Array<unknown> = [];
+
+  const runtime = new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      model: "deterministic",
+      contextWindow: 220,
+      compactThreshold: 180,
+      responder: async (request, invocation) => {
+        if (invocation <= 5) {
+          return {
+            toolCalls: [
+              {
+                id: `shell-${invocation}`,
+                name: "shell",
+                input: { command: `node -e "console.log('${"z".repeat(240)}')"` },
+              },
+            ],
+          };
+        }
+        finalToolMessages = request.messages.filter((message) => message.role === "tool").map((message) => message.content);
+        return { finalMessage: "done" };
+      },
+    }),
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 8 },
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "micro-structured",
+    userMessage: "many shells",
+    workspace: { cwd },
+  });
+
+  assert.equal(result.finalMessage, "done");
+  const placeholder = finalToolMessages.find(
+    (content) => content && typeof content === "object" && content.output?.replacementKind === "historical_tool_result_placeholder",
+  );
+  assert.equal(typeof placeholder?.output?.toolName, "string");
+  assert.match(placeholder?.output?.originalHash ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(typeof placeholder?.output?.originalSize, "number");
+  assert.equal(typeof placeholder?.output?.summaryLabel, "string");
+  assert.equal(String(placeholder?.output?.summaryLabel).startsWith("previous_"), true);
+});

@@ -190,7 +190,7 @@ test("AgentRuntime converts provider errors into typed events and a model_error 
   const events = await eventStore.forSession("provider-error");
   assert.deepEqual(
     events.map((event) => event.type),
-    ["UserMessage", "ContextBuilt", "ModelRequestStarted", "ModelError", "AgentFinished"],
+    ["UserMessage", "ContextBuilt", "InstructionsResolved", "ModelRequestStarted", "ModelError", "AgentFinished"],
   );
 });
 
@@ -233,6 +233,7 @@ test("AgentRuntime retries retryable provider errors and succeeds within retry b
     [
       "UserMessage",
       "ContextBuilt",
+      "InstructionsResolved",
       "ModelRequestStarted",
       "ModelError",
       "ModelRequestStarted",
