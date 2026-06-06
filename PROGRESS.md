@@ -17,6 +17,7 @@ The project now has a stable runtime core with:
 - memory maintenance analyzer groundwork
 - explicit memory maintenance apply path
 - memory product surface facade
+- memory command-runner surface
 
 Current repository state:
 
@@ -26,6 +27,7 @@ Current repository state:
 - read-only memory maintenance analysis is implemented
 - caller-invoked memory maintenance write-back is implemented
 - a library-level memory product surface is implemented
+- a minimal memory command-runner surface is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -234,6 +236,24 @@ Memory product surface constraints:
 - inspect with maintenance analyzes only the returned record set
 - no automatic maintenance execution is introduced
 
+### Phase 11: Memory CLI Surface
+
+Delivered in the working tree:
+
+- `MemoryCliCommand`
+- `runMemoryCli()`
+- default memory store path resolution from `cwd`
+- explicit relative `storePath` resolution
+- JSON-shaped inspect / analyze / apply command results
+- deterministic command dispatch errors
+
+Memory CLI surface constraints:
+
+- surface is command-runner only, not full `argv` parsing
+- no bin script or interactive UI yet
+- no automatic maintenance execution is introduced
+- command runner reuses existing memory facade and manager boundaries
+
 ## Current Test Surface
 
 Test files:
@@ -267,28 +287,30 @@ Covered behavior:
 - read-only memory conflict and freshness analysis
 - caller-invoked memory maintenance persistence
 - library-level memory inspect/analyze/apply facade behavior
+- command-runner memory inspect/analyze/apply behavior
 
 Current verification status:
 
-- full suite passes locally: `84/84`
+- full suite passes locally: `91/91`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory CLI Surface`
-   - local command entrypoint for inspect / analyze / apply
+1. `Memory argv/bin Wrapper`
+   - actual `process.argv` parsing and executable entrypoint
    - still no autonomous background maintenance
 
-Do not start MCP or multi-agent work before a minimal memory CLI boundary is stabilized.
+Do not start MCP or multi-agent work before the executable memory entrypoint boundary is stabilized.
 
 ## Known Constraints
 
 - Event storage remains local JSONL.
 - Memory storage is local JSONL/file-backed and separate from event storage.
-- There is still no product surface such as CLI/TUI/API.
+- There is now a minimal memory command-runner surface, but no argv/bin wrapper, TUI, or API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
 - Memory maintenance remains explicit and caller-driven with no autonomous persistence.
 - Memory product surface is still library-only with no user-facing command surface.
+- Memory CLI surface exists only as a programmatic command runner, not a shell-facing executable.

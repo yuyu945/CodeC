@@ -240,6 +240,28 @@ export interface MemorySurface {
   apply(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult>;
 }
 
+export type MemoryCliCommand =
+  | {
+      type: "inspect";
+      cwd: string;
+      storePath?: string;
+      query?: MemoryQuery;
+      includeMaintenance?: boolean;
+      maintenanceOptions?: MemoryMaintenanceOptions;
+    }
+  | {
+      type: "analyze";
+      cwd: string;
+      storePath?: string;
+      maintenanceOptions?: MemoryMaintenanceOptions;
+    }
+  | {
+      type: "apply";
+      cwd: string;
+      storePath?: string;
+      applyRequest: MemoryMaintenanceApplyRequest;
+    };
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

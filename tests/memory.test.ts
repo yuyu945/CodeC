@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -12,12 +12,15 @@ import {
   LocalMemorySurface,
   LocalMemoryManager,
   MemoryMaintenanceAnalyzer,
+  runMemoryCli,
   type MemoryMaintenanceApplyResult,
   type MemoryMaintenanceApplyRequest,
   type MemoryMaintenanceApplyResult as MaintenanceApplyResult,
+  type MemoryInspectResult,
   type MemoryMaintenanceReport,
   type MemoryMaintenanceOptions,
   type MemoryContextPayload,
+  type MemoryCliCommand,
   type MemoryManager,
   type MemoryQuery,
   type MemoryRecord,
@@ -873,3 +876,138 @@ function emptyApplyResult(records: MemoryRecord[]): MaintenanceApplyResult {
     records,
   };
 }
+
+test("runMemoryCli inspect returns a JSON-shaped inspect result from the default store path", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({ id: "mem-cli-inspect" }));
+
+  const result = await runMemoryCli({
+    type: "inspect",
+    cwd,
+  });
+
+  const inspectResult = result as MemoryInspectResult;
+  assert.deepEqual(inspectResult.records.map((record) => record.id), ["mem-cli-inspect"]);
+  assert.equal(inspectResult.maintenance, undefined);
+});
+
+test("runMemoryCli inspect supports query and maintenance on the returned record set", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-cli-query",
+    content: "Use pnpm test",
+    metadata: { lastSeenAt: "2026-05-01T00:00:00.000Z" },
+  }));
+  await manager.write(projectRecord({
+    id: "mem-cli-other",
+    content: "Different record",
+  }));
+
+  const result = await runMemoryCli({
+    type: "inspect",
+    cwd,
+    query: { text: "pnpm" },
+    includeMaintenance: true,
+    maintenanceOptions: { now: "2026-06-06T00:00:00.000Z" },
+  });
+
+  const inspectResult = result as MemoryInspectResult;
+  assert.deepEqual(inspectResult.records.map((record) => record.id), ["mem-cli-query"]);
+  assert.deepEqual(inspectResult.maintenance, {
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [
+      {
+        recordId: "mem-cli-query",
+        currentFreshness: "fresh",
+        suggestedFreshness: "aging",
+        reason: "last_seen_threshold_reached",
+      },
+    ],
+  });
+});
+
+test("runMemoryCli analyze returns a JSON-shaped maintenance report", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-cli-analyze",
+    metadata: { lastSeenAt: "2026-05-01T00:00:00.000Z" },
+  }));
+
+  const result = await runMemoryCli({
+    type: "analyze",
+    cwd,
+    maintenanceOptions: { now: "2026-06-06T00:00:00.000Z" },
+  });
+
+  assert.deepEqual(result, {
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [
+      {
+        recordId: "mem-cli-analyze",
+        currentFreshness: "fresh",
+        suggestedFreshness: "aging",
+        reason: "last_seen_threshold_reached",
+      },
+    ],
+  });
+});
+
+test("runMemoryCli apply writes back through the default store and returns a JSON-shaped result", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-cli-apply",
+    metadata: { lastSeenAt: "2026-05-01T00:00:00.000Z" },
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await runMemoryCli({
+    type: "apply",
+    cwd,
+    applyRequest: {
+      now: "2026-06-06T00:00:00.000Z",
+      freshnessSuggestions: report.freshnessSuggestions,
+    },
+  });
+
+  assert.equal((result as MaintenanceApplyResult).appliedFreshnessCount, 1);
+  assert.equal((result as MaintenanceApplyResult).records[0].freshness, "aging");
+  assert.equal((await manager.list())[0].freshness, "aging");
+});
+
+test("runMemoryCli resolves an explicit relative storePath from cwd", async () => {
+  const cwd = await workspace();
+  const relativeStorePath = "data/memory.jsonl";
+  const absoluteStorePath = resolve(cwd, relativeStorePath);
+  const manager = new LocalMemoryManager(new FileMemoryStore(absoluteStorePath));
+  await manager.write(projectRecord({ id: "mem-cli-relative-path" }));
+
+  const result = await runMemoryCli({
+    type: "inspect",
+    cwd,
+    storePath: relativeStorePath,
+  });
+
+  const inspectResult = result as MemoryInspectResult;
+  assert.deepEqual(inspectResult.records.map((record) => record.id), ["mem-cli-relative-path"]);
+});
+
+test("runMemoryCli rejects unsupported command types deterministically", async () => {
+  await assert.rejects(
+    runMemoryCli({ type: "unsupported", cwd: "D:/tmp" } as unknown as MemoryCliCommand),
+    /unsupported_memory_cli_command/,
+  );
+});
+
+test("runMemoryCli rejects apply commands without applyRequest deterministically", async () => {
+  const cwd = await workspace();
+  await assert.rejects(
+    runMemoryCli({ type: "apply", cwd } as unknown as MemoryCliCommand),
+    /memory_cli_apply_requires_request/,
+  );
+});

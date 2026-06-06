@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { redactSecretsInString } from "./shared.ts";
 import type {
@@ -12,6 +12,7 @@ import type {
   MemoryMaintenanceIssue,
   MemoryMaintenanceOptions,
   MemoryMaintenanceReport,
+  MemoryCliCommand,
   MemoryManager,
   MemoryQuery,
   MemoryRecord,
@@ -216,6 +217,29 @@ export class LocalMemorySurface implements MemorySurface {
   async apply(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult> {
     return await this.manager.applyMaintenance(request);
   }
+}
+
+export async function runMemoryCli(command: MemoryCliCommand): Promise<MemoryInspectResult | MemoryMaintenanceReport | MemoryMaintenanceApplyResult> {
+  const storePath = command.storePath ? resolve(command.cwd, command.storePath) : join(command.cwd, ".memory.jsonl");
+  const surface = new LocalMemorySurface(new LocalMemoryManager(new FileMemoryStore(storePath)));
+
+  if (command.type === "inspect") {
+    return await surface.inspect({
+      query: command.query,
+      includeMaintenance: command.includeMaintenance,
+      maintenanceOptions: command.maintenanceOptions,
+    });
+  }
+  if (command.type === "analyze") {
+    return await surface.analyze(command.maintenanceOptions);
+  }
+  if (command.type === "apply") {
+    if (!command.applyRequest) {
+      throw new Error("memory_cli_apply_requires_request");
+    }
+    return await surface.apply(command.applyRequest);
+  }
+  throw new Error("unsupported_memory_cli_command");
 }
 
 export function classifyMemoryScope(content: string): MemoryScope {
