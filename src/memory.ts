@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { redactSecretsInString } from "./shared.ts";
 import type {
+  MemoryMaintenanceApplyRequest,
+  MemoryMaintenanceApplyResult,
   MemoryFreshness,
   MemoryMaintenanceIssue,
   MemoryMaintenanceOptions,
@@ -50,6 +52,13 @@ export class FileMemoryStore {
       return true;
     });
   }
+
+  async replaceAll(records: MemoryRecord[]): Promise<MemoryRecord[]> {
+    await mkdir(dirname(this.filePath), { recursive: true });
+    const content = records.length === 0 ? "" : `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+    await writeFile(this.filePath, content, "utf8");
+    return records;
+  }
 }
 
 export class LocalMemoryManager implements MemoryManager {
@@ -79,6 +88,50 @@ export class LocalMemoryManager implements MemoryManager {
 
   async list(): Promise<MemoryRecord[]> {
     return await this.store.list();
+  }
+
+  async applyMaintenance(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult> {
+    const now = resolveNow(request.now);
+    const issues = request.issues ?? [];
+    const freshnessSuggestions = request.freshnessSuggestions ?? [];
+    const currentRecords = await this.store.list();
+    const nextRecords = currentRecords.map(cloneRecord);
+    const recordIndexes = new Map(nextRecords.map((record, index) => [record.id, index] as const));
+
+    let appliedFreshnessCount = 0;
+    for (const suggestion of freshnessSuggestions) {
+      const index = recordIndexes.get(suggestion.recordId);
+      if (index === undefined) continue;
+      const record = nextRecords[index];
+      if (record.freshness !== suggestion.currentFreshness) continue;
+      if (record.freshness === suggestion.suggestedFreshness) continue;
+      record.freshness = suggestion.suggestedFreshness;
+      appliedFreshnessCount += 1;
+    }
+
+    let appliedConflictCount = 0;
+    for (const issue of issues) {
+      if (applyConflictIssue(nextRecords, recordIndexes, issue)) {
+        appliedConflictCount += 1;
+      }
+    }
+
+    if (appliedConflictCount === 0 && appliedFreshnessCount === 0) {
+      return {
+        appliedAt: now.toISOString(),
+        appliedConflictCount,
+        appliedFreshnessCount,
+        records: currentRecords,
+      };
+    }
+
+    await this.store.replaceAll(nextRecords);
+    return {
+      appliedAt: now.toISOString(),
+      appliedConflictCount,
+      appliedFreshnessCount,
+      records: nextRecords,
+    };
   }
 }
 
@@ -247,4 +300,40 @@ function parseTimestamp(value: string | undefined): Date | undefined {
   const parsed = new Date(value);
   if (!Number.isFinite(parsed.getTime())) return undefined;
   return parsed;
+}
+
+function cloneRecord(record: MemoryRecord): MemoryRecord {
+  return {
+    ...record,
+    tags: record.tags ? [...record.tags] : undefined,
+    conflictsWith: record.conflictsWith ? [...record.conflictsWith] : undefined,
+    metadata: record.metadata ? { ...record.metadata } : undefined,
+  };
+}
+
+function applyConflictIssue(
+  records: MemoryRecord[],
+  recordIndexes: Map<string, number>,
+  issue: MemoryMaintenanceIssue,
+): boolean {
+  const leftIndex = recordIndexes.get(issue.recordId);
+  const rightIndex = recordIndexes.get(issue.otherRecordId);
+  let changed = false;
+
+  if (leftIndex !== undefined) {
+    changed = appendConflict(records[leftIndex], issue.otherRecordId) || changed;
+  }
+  if (rightIndex !== undefined) {
+    changed = appendConflict(records[rightIndex], issue.recordId) || changed;
+  }
+
+  return changed;
+}
+
+function appendConflict(record: MemoryRecord, otherRecordId: string): boolean {
+  const conflictsWith = record.conflictsWith ? [...record.conflictsWith] : [];
+  if (conflictsWith.includes(otherRecordId)) return false;
+  conflictsWith.push(otherRecordId);
+  record.conflictsWith = conflictsWith;
+  return true;
 }

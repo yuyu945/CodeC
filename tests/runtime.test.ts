@@ -240,6 +240,14 @@ test("runTurn exposes explicit memory context to the first model request without
       writes += 1;
       return record;
     },
+    async applyMaintenance() {
+      return {
+        appliedAt: "2026-06-06T00:00:00.000Z",
+        appliedConflictCount: 0,
+        appliedFreshnessCount: 0,
+        records: [projectMemory()],
+      };
+    },
     async list() {
       return [projectMemory()];
     },

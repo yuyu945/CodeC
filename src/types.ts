@@ -148,6 +148,7 @@ export interface MemoryManager {
   write(record: MemoryRecord): Promise<MemoryRecord>;
   retrieve(query: MemoryQuery): Promise<MemoryRecord[]>;
   list(): Promise<MemoryRecord[]>;
+  applyMaintenance(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult>;
 }
 
 export interface RedactedMemoryRecord {
@@ -207,6 +208,19 @@ export interface MemoryMaintenanceOptions {
   now?: Date | string;
   agingAfterDays?: number;
   staleAfterDays?: number;
+}
+
+export interface MemoryMaintenanceApplyRequest {
+  now?: Date | string;
+  issues?: MemoryMaintenanceIssue[];
+  freshnessSuggestions?: MemoryFreshnessSuggestion[];
+}
+
+export interface MemoryMaintenanceApplyResult {
+  appliedAt: string;
+  appliedConflictCount: number;
+  appliedFreshnessCount: number;
+  records: MemoryRecord[];
 }
 
 export interface ContextBundle {

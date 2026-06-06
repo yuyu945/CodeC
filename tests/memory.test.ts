@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -11,6 +11,7 @@ import {
   JsonlEventStore,
   LocalMemoryManager,
   MemoryMaintenanceAnalyzer,
+  type MemoryMaintenanceApplyResult,
   type MemoryMaintenanceReport,
   type MemoryContextPayload,
   type MemoryRecord,
@@ -408,4 +409,227 @@ test("MemoryMaintenanceAnalyzer does not mutate input records", () => {
 
   assert.equal(JSON.stringify(records), before);
   assert.equal(typeof (report as MemoryMaintenanceReport).checkedAt, "string");
+});
+
+test("LocalMemoryManager applyMaintenance updates approved freshness suggestions and persists them", async () => {
+  const cwd = await workspace();
+  const path = join(cwd, ".memory.jsonl");
+  const manager = new LocalMemoryManager(new FileMemoryStore(path));
+  await manager.write(projectRecord({
+    id: "mem-apply-freshness",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-05-01T00:00:00.000Z",
+    },
+  }));
+
+  const analyzer = new MemoryMaintenanceAnalyzer();
+  const report = analyzer.analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    freshnessSuggestions: report.freshnessSuggestions,
+  });
+
+  assert.equal((result as MemoryMaintenanceApplyResult).appliedAt, "2026-06-06T00:00:00.000Z");
+  assert.equal(result.appliedFreshnessCount, 1);
+  assert.equal(result.appliedConflictCount, 0);
+  assert.deepEqual(result.records.map((record) => record.id), ["mem-apply-freshness"]);
+  assert.equal(result.records[0].freshness, "aging");
+
+  const records = await manager.list();
+  assert.equal(records[0].freshness, "aging");
+  const persisted = await readFile(path, "utf8");
+  assert.match(persisted, /"freshness":"aging"/);
+});
+
+test("LocalMemoryManager applyMaintenance applies approved conflict issues symmetrically without duplicates", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-conflict-a",
+    content: "Use pnpm test",
+    tags: ["test-command"],
+  }));
+  await manager.write(projectRecord({
+    id: "mem-conflict-b",
+    content: "Do not use pnpm test, use npm.cmd test instead",
+    tags: ["test-command"],
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    issues: report.issues,
+  });
+
+  assert.equal(result.appliedConflictCount, 1);
+  assert.equal(result.appliedFreshnessCount, 0);
+
+  const records = await manager.list();
+  const left = records.find((record) => record.id === "mem-conflict-a");
+  const right = records.find((record) => record.id === "mem-conflict-b");
+  assert.deepEqual(left?.conflictsWith, ["mem-conflict-b"]);
+  assert.deepEqual(right?.conflictsWith, ["mem-conflict-a"]);
+
+  const secondPass = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    issues: report.issues,
+  });
+  assert.equal(secondPass.appliedConflictCount, 0);
+});
+
+test("LocalMemoryManager applyMaintenance treats repeated approved issues as one applied change", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({ id: "mem-dup-a", content: "Use pnpm test", tags: ["test-command"] }));
+  await manager.write(projectRecord({ id: "mem-dup-b", content: "Do not use pnpm test, use npm.cmd test instead", tags: ["test-command"] }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    issues: [...report.issues, ...report.issues],
+  });
+
+  assert.equal(result.appliedConflictCount, 1);
+});
+
+test("LocalMemoryManager applyMaintenance only applies caller-selected updates", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-selective-a",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-05-01T00:00:00.000Z",
+    },
+  }));
+  await manager.write(projectRecord({
+    id: "mem-selective-b",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-02-01T00:00:00.000Z",
+    },
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const selected = report.freshnessSuggestions.filter((item) => item.recordId === "mem-selective-a");
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    freshnessSuggestions: selected,
+  });
+
+  assert.equal(result.appliedFreshnessCount, 1);
+  const records = await manager.list();
+  assert.equal(records.find((record) => record.id === "mem-selective-a")?.freshness, "aging");
+  assert.equal(records.find((record) => record.id === "mem-selective-b")?.freshness, "fresh");
+});
+
+test("LocalMemoryManager applyMaintenance skips freshness suggestions when store freshness has drifted", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-drift",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-05-01T00:00:00.000Z",
+    },
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    freshnessSuggestions: report.freshnessSuggestions,
+  });
+
+  const driftedResult = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    freshnessSuggestions: report.freshnessSuggestions,
+  });
+
+  assert.equal(driftedResult.appliedFreshnessCount, 0);
+  assert.equal(driftedResult.records[0].freshness, "aging");
+});
+
+test("LocalMemoryManager applyMaintenance treats repeated approved freshness suggestions as one applied change", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-repeat-freshness",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-05-01T00:00:00.000Z",
+    },
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    freshnessSuggestions: [...report.freshnessSuggestions, ...report.freshnessSuggestions],
+  });
+
+  assert.equal(result.appliedFreshnessCount, 1);
+});
+
+test("LocalMemoryManager applyMaintenance ignores missing records and does not mutate unrelated fields", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-stable",
+    content: "stable content",
+    tags: ["stable"],
+    metadata: {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      custom: "keep-me",
+    },
+  }));
+
+  const before = await manager.list();
+  const result = await manager.applyMaintenance({
+    now: "2026-06-06T00:00:00.000Z",
+    issues: [{ type: "conflict", recordId: "mem-stable", otherRecordId: "mem-missing", reason: "explicit_conflicts_with" }],
+    freshnessSuggestions: [{ recordId: "mem-ghost", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" }],
+  });
+
+  assert.equal(result.appliedFreshnessCount, 0);
+  assert.equal(result.appliedConflictCount, 1);
+
+  const after = await manager.list();
+  assert.deepEqual(after[0].conflictsWith, ["mem-missing"]);
+  assert.equal(after[0].content, before[0].content);
+  assert.deepEqual(after[0].tags, before[0].tags);
+  assert.equal((after[0].metadata as { custom?: string }).custom, "keep-me");
+});
+
+test("LocalMemoryManager applyMaintenance treats omitted arrays as empty and avoids rewriting on no-op", async () => {
+  const cwd = await workspace();
+  const path = join(cwd, ".memory.jsonl");
+  const manager = new LocalMemoryManager(new FileMemoryStore(path));
+
+  const result = await manager.applyMaintenance({});
+
+  assert.equal(result.appliedConflictCount, 0);
+  assert.equal(result.appliedFreshnessCount, 0);
+  assert.deepEqual(result.records, []);
+  await assert.rejects(access(path));
+});
+
+test("LocalMemoryManager applyMaintenance falls back to current time when request.now is invalid", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-invalid-now",
+    freshness: "fresh",
+    metadata: {
+      lastSeenAt: "2026-05-01T00:00:00.000Z",
+    },
+  }));
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(await manager.list(), { now: "2026-06-06T00:00:00.000Z" });
+  const result = await manager.applyMaintenance({
+    now: "not-a-date",
+    freshnessSuggestions: report.freshnessSuggestions,
+  });
+
+  assert.match(result.appliedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(result.records[0].freshness, "aging");
 });

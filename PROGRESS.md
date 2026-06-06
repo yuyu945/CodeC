@@ -15,6 +15,7 @@ The project now has a stable runtime core with:
 - memory manager foundation for explicit project/reference records
 - explicit caller-selected memory context integration
 - memory maintenance analyzer groundwork
+- explicit memory maintenance apply path
 
 Current repository state:
 
@@ -22,6 +23,7 @@ Current repository state:
 - context, instruction, replay, retry, redaction, local inspection, and memory foundation behavior are implemented
 - explicit memory injection and non-persistent memory suggestions are implemented
 - read-only memory maintenance analysis is implemented
+- caller-invoked memory maintenance write-back is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -192,6 +194,25 @@ Memory maintenance constraints:
 - no automatic write-back of freshness or conflict metadata
 - no background executor / Auto Dream
 
+### Phase 9: Explicit Memory Maintenance Apply Path
+
+Delivered in the working tree:
+
+- `MemoryManager.applyMaintenance()`
+- `MemoryMaintenanceApplyRequest`
+- `MemoryMaintenanceApplyResult`
+- caller-selected freshness write-back
+- caller-selected conflict write-back
+- no-op apply short-circuit without store rewrite
+- full-order persisted record return from apply results
+
+Memory maintenance apply constraints:
+
+- apply remains caller-invoked and separate from analysis
+- no automatic/background execution
+- apply only changes approved freshness/conflict fields
+- apply skips stale approvals when current record state has drifted
+
 ## Current Test Surface
 
 Test files:
@@ -223,20 +244,21 @@ Covered behavior:
 - explicit memory context injection
 - non-persistent runtime memory suggestions
 - read-only memory conflict and freshness analysis
+- caller-invoked memory maintenance persistence
 
 Current verification status:
 
-- full suite passes locally: `69/69`
+- full suite passes locally: `78/78`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Explicit Memory Maintenance Apply Path`
-   - caller-invoked write-back of approved freshness/conflict updates
-   - still no automatic/background execution
+1. `Memory Product Surface`
+   - explicit entrypoint for inspect / analyze / apply flows
+   - still no autonomous background maintenance
 
-Do not start MCP, multi-agent, or product surfaces before explicit memory maintenance apply behavior is stabilized.
+Do not start MCP or multi-agent work before memory product surface boundaries are stabilized.
 
 ## Known Constraints
 
@@ -246,4 +268,4 @@ Do not start MCP, multi-agent, or product surfaces before explicit memory mainte
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
-- Memory maintenance remains analysis-only with no automatic persistence.
+- Memory maintenance remains explicit and caller-driven with no autonomous persistence.
