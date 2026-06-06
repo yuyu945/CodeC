@@ -183,6 +183,32 @@ export interface MemoryWriteSuggestion {
   metadata?: Record<string, unknown>;
 }
 
+export interface MemoryMaintenanceIssue {
+  type: "conflict";
+  recordId: string;
+  otherRecordId: string;
+  reason: string;
+}
+
+export interface MemoryFreshnessSuggestion {
+  recordId: string;
+  currentFreshness: MemoryFreshness;
+  suggestedFreshness: MemoryFreshness;
+  reason: string;
+}
+
+export interface MemoryMaintenanceReport {
+  checkedAt: string;
+  issues: MemoryMaintenanceIssue[];
+  freshnessSuggestions: MemoryFreshnessSuggestion[];
+}
+
+export interface MemoryMaintenanceOptions {
+  now?: Date | string;
+  agingAfterDays?: number;
+  staleAfterDays?: number;
+}
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

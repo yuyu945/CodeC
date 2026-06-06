@@ -10,6 +10,8 @@ import {
   FileMemoryStore,
   JsonlEventStore,
   LocalMemoryManager,
+  MemoryMaintenanceAnalyzer,
+  type MemoryMaintenanceReport,
   type MemoryContextPayload,
   type MemoryRecord,
 } from "../src/index.ts";
@@ -221,4 +223,189 @@ test("ContextBuilder redacts injected memory content", async () => {
 
   const payload = context.fragments.find((fragment) => fragment.summaryKind === "memory")?.content as MemoryContextPayload;
   assert.doesNotMatch(payload.records[0].content, /sk-secret-123/);
+});
+
+test("MemoryMaintenanceAnalyzer emits explicit conflict issues even when target record is missing", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-explicit",
+      conflictsWith: ["mem-missing"],
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.match(report.checkedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual(report.issues, [
+    {
+      type: "conflict",
+      recordId: "mem-explicit",
+      otherRecordId: "mem-missing",
+      reason: "explicit_conflicts_with",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer detects heuristic conflicts for shared-tag replacement phrasing", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-pnpm",
+      content: "Use pnpm test",
+      tags: ["test-command"],
+    }),
+    projectRecord({
+      id: "mem-npmcmd",
+      content: "Do not use pnpm test, use npm.cmd test instead",
+      tags: ["test-command"],
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.issues, [
+    {
+      type: "conflict",
+      recordId: "mem-pnpm",
+      otherRecordId: "mem-npmcmd",
+      reason: "heuristic_signal_phrase_conflict",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer skips heuristic conflicts without shared tags or across scopes", () => {
+  const analyzer = new MemoryMaintenanceAnalyzer();
+
+  const noSharedTags = analyzer.analyze([
+    projectRecord({ id: "mem-a", content: "Use pnpm test", tags: ["a"] }),
+    projectRecord({ id: "mem-b", content: "Do not use pnpm test, use npm.cmd test instead", tags: ["b"] }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+  assert.deepEqual(noSharedTags.issues, []);
+
+  const crossScope = analyzer.analyze([
+    projectRecord({ id: "mem-project", content: "Use pnpm test", tags: ["test-command"], scope: "project" }),
+    projectRecord({ id: "mem-reference", content: "Do not use pnpm test, use npm.cmd test instead", tags: ["test-command"], scope: "reference", loadPolicy: "on_demand" }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+  assert.deepEqual(crossScope.issues, []);
+});
+
+test("MemoryMaintenanceAnalyzer suppresses duplicate conflict pairs when explicit and heuristic both match", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-a",
+      content: "Use pnpm test",
+      tags: ["test-command"],
+      conflictsWith: ["mem-b"],
+    }),
+    projectRecord({
+      id: "mem-b",
+      content: "Do not use pnpm test, use npm.cmd test instead",
+      tags: ["test-command"],
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.issues, [
+    {
+      type: "conflict",
+      recordId: "mem-a",
+      otherRecordId: "mem-b",
+      reason: "explicit_conflicts_with",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer prefers lastSeenAt over createdAt for freshness aging", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-aging",
+      freshness: "fresh",
+      metadata: {
+        createdAt: "2025-01-01T00:00:00.000Z",
+        lastSeenAt: "2026-05-01T00:00:00.000Z",
+      },
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.freshnessSuggestions, [
+    {
+      recordId: "mem-aging",
+      currentFreshness: "fresh",
+      suggestedFreshness: "aging",
+      reason: "last_seen_threshold_reached",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer suggests stale once age meets the stale threshold", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-stale",
+      freshness: "fresh",
+      metadata: {
+        lastSeenAt: "2026-03-08T00:00:00.000Z",
+      },
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.freshnessSuggestions, [
+    {
+      recordId: "mem-stale",
+      currentFreshness: "fresh",
+      suggestedFreshness: "stale",
+      reason: "last_seen_threshold_reached",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer prioritizes expired records but skips stale no-op suggestions", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-expired",
+      freshness: "aging",
+      expiresAt: "2026-06-05T00:00:00.000Z",
+    }),
+    projectRecord({
+      id: "mem-already-stale",
+      freshness: "stale",
+      expiresAt: "2026-06-05T00:00:00.000Z",
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.freshnessSuggestions, [
+    {
+      recordId: "mem-expired",
+      currentFreshness: "aging",
+      suggestedFreshness: "stale",
+      reason: "record_expired",
+    },
+  ]);
+});
+
+test("MemoryMaintenanceAnalyzer ignores invalid timestamps without throwing", () => {
+  const report = new MemoryMaintenanceAnalyzer().analyze([
+    projectRecord({
+      id: "mem-invalid-timestamps",
+      metadata: {
+        createdAt: "not-a-date",
+        lastSeenAt: "still-not-a-date",
+      },
+      expiresAt: "also-not-a-date",
+    }),
+  ], { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.deepEqual(report.freshnessSuggestions, []);
+});
+
+test("MemoryMaintenanceAnalyzer does not mutate input records", () => {
+  const records = [
+    projectRecord({
+      id: "mem-immutable",
+      tags: ["test-command"],
+      conflictsWith: ["mem-other"],
+      metadata: {
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    }),
+  ];
+  const before = JSON.stringify(records);
+
+  const report = new MemoryMaintenanceAnalyzer().analyze(records, { now: "2026-06-06T00:00:00.000Z" });
+
+  assert.equal(JSON.stringify(records), before);
+  assert.equal(typeof (report as MemoryMaintenanceReport).checkedAt, "string");
 });

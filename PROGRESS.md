@@ -14,12 +14,14 @@ The project now has a stable runtime core with:
 - local observability derived from existing `AgentEvent`
 - memory manager foundation for explicit project/reference records
 - explicit caller-selected memory context integration
+- memory maintenance analyzer groundwork
 
 Current repository state:
 
 - the runtime is test-driven and runnable through the local test harness
 - context, instruction, replay, retry, redaction, local inspection, and memory foundation behavior are implemented
 - explicit memory injection and non-persistent memory suggestions are implemented
+- read-only memory maintenance analysis is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -171,6 +173,25 @@ Memory integration constraints:
 - provider adapters do not parse provider-native responses into memory suggestions
 - memory context is one aggregate fragment, not one fragment per selection
 
+### Phase 8: Memory Maintenance Groundwork
+
+Delivered in the working tree:
+
+- `MemoryMaintenanceAnalyzer`
+- serializable `MemoryMaintenanceReport`
+- explicit conflict pair detection
+- heuristic shared-tag signal-phrase conflict detection
+- freshness aging suggestions from `lastSeenAt` / `createdAt`
+- expiration-driven stale suggestions
+- duplicate conflict suppression across explicit and heuristic detection
+
+Memory maintenance constraints:
+
+- analyzer is read-only and does not mutate input records
+- analyzer does not read or write memory stores directly
+- no automatic write-back of freshness or conflict metadata
+- no background executor / Auto Dream
+
 ## Current Test Surface
 
 Test files:
@@ -201,21 +222,21 @@ Covered behavior:
 - explicit durable memory storage and retrieval
 - explicit memory context injection
 - non-persistent runtime memory suggestions
+- read-only memory conflict and freshness analysis
 
 Current verification status:
 
-- full suite passes locally: `60/60`
+- full suite passes locally: `69/69`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory Maintenance Groundwork`
-   - conflict detection
-   - freshness/aging mechanics
-   - still no background Auto Dream executor
+1. `Explicit Memory Maintenance Apply Path`
+   - caller-invoked write-back of approved freshness/conflict updates
+   - still no automatic/background execution
 
-Do not start MCP, multi-agent, or product surfaces before memory maintenance groundwork is stabilized.
+Do not start MCP, multi-agent, or product surfaces before explicit memory maintenance apply behavior is stabilized.
 
 ## Known Constraints
 
@@ -225,3 +246,4 @@ Do not start MCP, multi-agent, or product surfaces before memory maintenance gro
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
+- Memory maintenance remains analysis-only with no automatic persistence.
