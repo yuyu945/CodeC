@@ -223,6 +223,23 @@ export interface MemoryMaintenanceApplyResult {
   records: MemoryRecord[];
 }
 
+export interface MemoryInspectRequest {
+  query?: MemoryQuery;
+  includeMaintenance?: boolean;
+  maintenanceOptions?: MemoryMaintenanceOptions;
+}
+
+export interface MemoryInspectResult {
+  records: MemoryRecord[];
+  maintenance?: MemoryMaintenanceReport;
+}
+
+export interface MemorySurface {
+  inspect(request?: MemoryInspectRequest): Promise<MemoryInspectResult>;
+  analyze(options?: MemoryMaintenanceOptions): Promise<MemoryMaintenanceReport>;
+  apply(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult>;
+}
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

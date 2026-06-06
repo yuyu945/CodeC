@@ -7,6 +7,8 @@ import type {
   MemoryMaintenanceApplyRequest,
   MemoryMaintenanceApplyResult,
   MemoryFreshness,
+  MemoryInspectRequest,
+  MemoryInspectResult,
   MemoryMaintenanceIssue,
   MemoryMaintenanceOptions,
   MemoryMaintenanceReport,
@@ -14,6 +16,7 @@ import type {
   MemoryQuery,
   MemoryRecord,
   MemoryScope,
+  MemorySurface,
 } from "./types.ts";
 
 export class FileMemoryStore {
@@ -181,6 +184,37 @@ export class MemoryMaintenanceAnalyzer {
       issues,
       freshnessSuggestions,
     };
+  }
+}
+
+export class LocalMemorySurface implements MemorySurface {
+  private readonly manager: MemoryManager;
+  private readonly analyzer: MemoryMaintenanceAnalyzer;
+
+  constructor(manager: MemoryManager, analyzer?: MemoryMaintenanceAnalyzer) {
+    this.manager = manager;
+    this.analyzer = analyzer ?? new MemoryMaintenanceAnalyzer();
+  }
+
+  async inspect(request: MemoryInspectRequest = {}): Promise<MemoryInspectResult> {
+    const records = request.query
+      ? await this.manager.retrieve(request.query)
+      : await this.manager.list();
+    if (request.includeMaintenance !== true) {
+      return { records };
+    }
+    return {
+      records,
+      maintenance: this.analyzer.analyze(records, request.maintenanceOptions),
+    };
+  }
+
+  async analyze(options: MemoryMaintenanceOptions = {}): Promise<MemoryMaintenanceReport> {
+    return this.analyzer.analyze(await this.manager.list(), options);
+  }
+
+  async apply(request: MemoryMaintenanceApplyRequest): Promise<MemoryMaintenanceApplyResult> {
+    return await this.manager.applyMaintenance(request);
   }
 }
 

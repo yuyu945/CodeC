@@ -9,11 +9,17 @@ import {
   ContextBuilder,
   FileMemoryStore,
   JsonlEventStore,
+  LocalMemorySurface,
   LocalMemoryManager,
   MemoryMaintenanceAnalyzer,
   type MemoryMaintenanceApplyResult,
+  type MemoryMaintenanceApplyRequest,
+  type MemoryMaintenanceApplyResult as MaintenanceApplyResult,
   type MemoryMaintenanceReport,
+  type MemoryMaintenanceOptions,
   type MemoryContextPayload,
+  type MemoryManager,
+  type MemoryQuery,
   type MemoryRecord,
 } from "../src/index.ts";
 
@@ -633,3 +639,237 @@ test("LocalMemoryManager applyMaintenance falls back to current time when reques
   assert.match(result.appliedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(result.records[0].freshness, "aging");
 });
+
+test("LocalMemorySurface inspect defaults to list and returns records without maintenance", async () => {
+  const calls = { list: 0, retrieve: 0, apply: 0 };
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve() {
+      calls.retrieve += 1;
+      return [];
+    },
+    async list() {
+      calls.list += 1;
+      return [projectRecord({ id: "mem-surface-list" })];
+    },
+    async applyMaintenance() {
+      calls.apply += 1;
+      return emptyApplyResult([]);
+    },
+  };
+
+  const result = await new LocalMemorySurface(manager).inspect();
+
+  assert.deepEqual(result.records.map((record) => record.id), ["mem-surface-list"]);
+  assert.equal(result.maintenance, undefined);
+  assert.equal(calls.list, 1);
+  assert.equal(calls.retrieve, 0);
+  assert.equal(calls.apply, 0);
+});
+
+test("LocalMemorySurface inspect with query routes to retrieve and forwards maintenance options to analyzer", async () => {
+  const calls = { list: 0, retrieve: 0, apply: 0 };
+  const query: MemoryQuery = { scope: "project", text: "pnpm" };
+  const records = [projectRecord({ id: "mem-surface-query" })];
+  const analyzerCalls: Array<{ records: MemoryRecord[]; options: MemoryMaintenanceOptions | undefined }> = [];
+  const analyzer = {
+    analyze(input: MemoryRecord[], options?: MemoryMaintenanceOptions): MemoryMaintenanceReport {
+      analyzerCalls.push({ records: input, options });
+      return {
+        checkedAt: "2026-06-06T00:00:00.000Z",
+        issues: [],
+        freshnessSuggestions: [],
+      };
+    },
+  } as MemoryMaintenanceAnalyzer;
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve(receivedQuery) {
+      calls.retrieve += 1;
+      assert.deepEqual(receivedQuery, query);
+      return records;
+    },
+    async list() {
+      calls.list += 1;
+      return [];
+    },
+    async applyMaintenance() {
+      calls.apply += 1;
+      return emptyApplyResult([]);
+    },
+  };
+
+  const result = await new LocalMemorySurface(manager, analyzer).inspect({
+    query,
+    includeMaintenance: true,
+    maintenanceOptions: { now: "2026-06-06T00:00:00.000Z", agingAfterDays: 12, staleAfterDays: 34 },
+  });
+
+  assert.deepEqual(result.records.map((record) => record.id), ["mem-surface-query"]);
+  assert.deepEqual(result.maintenance, {
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [],
+  });
+  assert.equal(calls.list, 0);
+  assert.equal(calls.retrieve, 1);
+  assert.equal(calls.apply, 0);
+  assert.equal(analyzerCalls.length, 1);
+  assert.deepEqual(analyzerCalls[0].records.map((record) => record.id), ["mem-surface-query"]);
+  assert.deepEqual(analyzerCalls[0].options, { now: "2026-06-06T00:00:00.000Z", agingAfterDays: 12, staleAfterDays: 34 });
+});
+
+test("LocalMemorySurface inspect with maintenance returns an empty report for an empty result set", async () => {
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve() {
+      return [];
+    },
+    async list() {
+      return [];
+    },
+    async applyMaintenance() {
+      return emptyApplyResult([]);
+    },
+  };
+
+  const result = await new LocalMemorySurface(manager).inspect({
+    query: { scope: "project" },
+    includeMaintenance: true,
+    maintenanceOptions: { now: "2026-06-06T00:00:00.000Z" },
+  });
+
+  assert.deepEqual(result.records, []);
+  assert.deepEqual(result.maintenance, {
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [],
+  });
+});
+
+test("LocalMemorySurface analyze always uses full list and forwards options to analyzer", async () => {
+  const calls = { list: 0, retrieve: 0, apply: 0 };
+  const records = [projectRecord({ id: "mem-surface-analyze" })];
+  const analyzerCalls: Array<{ records: MemoryRecord[]; options: MemoryMaintenanceOptions | undefined }> = [];
+  const analyzer = {
+    analyze(input: MemoryRecord[], options?: MemoryMaintenanceOptions): MemoryMaintenanceReport {
+      analyzerCalls.push({ records: input, options });
+      return {
+        checkedAt: "2026-06-06T00:00:00.000Z",
+        issues: [],
+        freshnessSuggestions: [],
+      };
+    },
+  } as MemoryMaintenanceAnalyzer;
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve() {
+      calls.retrieve += 1;
+      return [];
+    },
+    async list() {
+      calls.list += 1;
+      return records;
+    },
+    async applyMaintenance() {
+      calls.apply += 1;
+      return emptyApplyResult([]);
+    },
+  };
+
+  const report = await new LocalMemorySurface(manager, analyzer).analyze({
+    now: "2026-06-06T00:00:00.000Z",
+    agingAfterDays: 40,
+  });
+
+  assert.deepEqual(report, {
+    checkedAt: "2026-06-06T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [],
+  });
+  assert.equal(calls.list, 1);
+  assert.equal(calls.retrieve, 0);
+  assert.equal(calls.apply, 0);
+  assert.deepEqual(analyzerCalls[0].records.map((record) => record.id), ["mem-surface-analyze"]);
+  assert.deepEqual(analyzerCalls[0].options, { now: "2026-06-06T00:00:00.000Z", agingAfterDays: 40 });
+});
+
+test("LocalMemorySurface apply only forwards the request to manager.applyMaintenance", async () => {
+  const captured: { request?: MemoryMaintenanceApplyRequest; applyCalls: number; listCalls: number; retrieveCalls: number } = {
+    applyCalls: 0,
+    listCalls: 0,
+    retrieveCalls: 0,
+  };
+  const expectedResult = emptyApplyResult([projectRecord({ id: "mem-surface-apply" })]);
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve() {
+      captured.retrieveCalls += 1;
+      return [];
+    },
+    async list() {
+      captured.listCalls += 1;
+      return [];
+    },
+    async applyMaintenance(request) {
+      captured.applyCalls += 1;
+      captured.request = request;
+      return expectedResult;
+    },
+  };
+
+  const request: MemoryMaintenanceApplyRequest = {
+    now: "2026-06-06T00:00:00.000Z",
+    issues: [{ type: "conflict", recordId: "a", otherRecordId: "b", reason: "explicit_conflicts_with" }],
+  };
+  const result = await new LocalMemorySurface(manager).apply(request);
+
+  assert.equal(captured.applyCalls, 1);
+  assert.equal(captured.listCalls, 0);
+  assert.equal(captured.retrieveCalls, 0);
+  assert.deepEqual(captured.request, request);
+  assert.deepEqual(result, expectedResult);
+});
+
+test("LocalMemorySurface reuses the same default analyzer instance within one surface instance", async () => {
+  const manager: MemoryManager = {
+    async write(record) {
+      return record;
+    },
+    async retrieve() {
+      return [];
+    },
+    async list() {
+      return [projectRecord({ id: "mem-default-analyzer" })];
+    },
+    async applyMaintenance() {
+      return emptyApplyResult([]);
+    },
+  };
+
+  const surface = new LocalMemorySurface(manager);
+  const firstAnalyzer = (surface as unknown as { analyzer: unknown }).analyzer;
+  await surface.analyze({ now: "2026-06-06T00:00:00.000Z" });
+  const secondAnalyzer = (surface as unknown as { analyzer: unknown }).analyzer;
+
+  assert.equal(firstAnalyzer, secondAnalyzer);
+});
+
+function emptyApplyResult(records: MemoryRecord[]): MaintenanceApplyResult {
+  return {
+    appliedAt: "2026-06-06T00:00:00.000Z",
+    appliedConflictCount: 0,
+    appliedFreshnessCount: 0,
+    records,
+  };
+}

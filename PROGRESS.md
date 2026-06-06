@@ -16,6 +16,7 @@ The project now has a stable runtime core with:
 - explicit caller-selected memory context integration
 - memory maintenance analyzer groundwork
 - explicit memory maintenance apply path
+- memory product surface facade
 
 Current repository state:
 
@@ -24,6 +25,7 @@ Current repository state:
 - explicit memory injection and non-persistent memory suggestions are implemented
 - read-only memory maintenance analysis is implemented
 - caller-invoked memory maintenance write-back is implemented
+- a library-level memory product surface is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -213,6 +215,25 @@ Memory maintenance apply constraints:
 - apply only changes approved freshness/conflict fields
 - apply skips stale approvals when current record state has drifted
 
+### Phase 10: Memory Product Surface
+
+Delivered in the working tree:
+
+- `MemorySurface`
+- `MemoryInspectRequest`
+- `MemoryInspectResult`
+- `LocalMemorySurface`
+- query-view `inspect()` flow
+- full-library-view `analyze()` flow
+- direct `apply()` facade delegation
+
+Memory product surface constraints:
+
+- product surface is library-only, not CLI/TUI/API yet
+- inspect and analyze remain intentionally different views
+- inspect with maintenance analyzes only the returned record set
+- no automatic maintenance execution is introduced
+
 ## Current Test Surface
 
 Test files:
@@ -245,20 +266,21 @@ Covered behavior:
 - non-persistent runtime memory suggestions
 - read-only memory conflict and freshness analysis
 - caller-invoked memory maintenance persistence
+- library-level memory inspect/analyze/apply facade behavior
 
 Current verification status:
 
-- full suite passes locally: `78/78`
+- full suite passes locally: `84/84`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory Product Surface`
-   - explicit entrypoint for inspect / analyze / apply flows
+1. `Memory CLI Surface`
+   - local command entrypoint for inspect / analyze / apply
    - still no autonomous background maintenance
 
-Do not start MCP or multi-agent work before memory product surface boundaries are stabilized.
+Do not start MCP or multi-agent work before a minimal memory CLI boundary is stabilized.
 
 ## Known Constraints
 
@@ -269,3 +291,4 @@ Do not start MCP or multi-agent work before memory product surface boundaries ar
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
 - Memory maintenance remains explicit and caller-driven with no autonomous persistence.
+- Memory product surface is still library-only with no user-facing command surface.
