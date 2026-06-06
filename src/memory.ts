@@ -13,6 +13,7 @@ import type {
   MemoryMaintenanceOptions,
   MemoryMaintenanceReport,
   MemoryCliCommand,
+  MemoryCliExecutionResult,
   MemoryManager,
   MemoryQuery,
   MemoryRecord,
@@ -242,6 +243,95 @@ export async function runMemoryCli(command: MemoryCliCommand): Promise<MemoryIns
   throw new Error("unsupported_memory_cli_command");
 }
 
+export function parseMemoryCliArgv(argv: string[]): MemoryCliCommand {
+  const [commandName, ...rest] = argv;
+  if (!commandName) throw new Error("memory_cli_requires_command");
+  if (commandName !== "inspect" && commandName !== "analyze" && commandName !== "apply") {
+    throw new Error("unsupported_memory_cli_command");
+  }
+
+  const values = new Map<string, string[]>();
+  const flags = new Set<string>();
+  for (let index = 0; index < rest.length; index += 1) {
+    const token = rest[index];
+    if (!token.startsWith("--")) {
+      throw new Error("memory_cli_invalid_flag");
+    }
+    if (token === "--include-maintenance") {
+      flags.add(token);
+      continue;
+    }
+    const value = rest[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error("memory_cli_missing_flag_value");
+    }
+    const existing = values.get(token) ?? [];
+    existing.push(value);
+    values.set(token, existing);
+    index += 1;
+  }
+
+  const cwd = singleRequired(values, "--cwd", "memory_cli_requires_cwd");
+  const storePath = singleOptional(values, "--store-path");
+
+  if (commandName === "inspect") {
+    const tags = values.get("--tag");
+    return {
+      type: "inspect",
+      cwd,
+      storePath,
+      query: buildQuery({
+        scope: singleOptional(values, "--scope"),
+        text: singleOptional(values, "--text"),
+        tags,
+      }),
+      includeMaintenance: flags.has("--include-maintenance") ? true : undefined,
+      maintenanceOptions: buildMaintenanceOptions(values),
+    };
+  }
+
+  if (commandName === "analyze") {
+    return {
+      type: "analyze",
+      cwd,
+      storePath,
+      maintenanceOptions: buildMaintenanceOptions(values),
+    };
+  }
+
+  const requestFile = singleRequired(values, "--request-file", "memory_cli_apply_requires_request_file");
+  return {
+    type: "apply",
+    cwd,
+    storePath,
+    requestFile,
+  } as unknown as MemoryCliCommand;
+}
+
+export async function executeMemoryCli(argv: string[]): Promise<MemoryCliExecutionResult> {
+  try {
+    const command = parseMemoryCliArgv(argv);
+    const resolvedCommand = command.type === "apply"
+      ? {
+          ...command,
+          applyRequest: await readApplyRequest(command.cwd, (command as { requestFile: string }).requestFile),
+        }
+      : command;
+    const result = await runMemoryCli(resolvedCommand as MemoryCliCommand);
+    return {
+      exitCode: 0,
+      stdout: `${JSON.stringify(result, null, 2)}\n`,
+      stderr: "",
+    };
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `${normalizeCliError(error)}\n`,
+    };
+  }
+}
+
 export function classifyMemoryScope(content: string): MemoryScope {
   const normalized = content.toLowerCase();
   if (normalized.includes("http://") || normalized.includes("https://") || normalized.includes("issue") || normalized.includes("pr ") || normalized.includes("pull request") || normalized.includes("runbook") || normalized.includes("entry point") || normalized.includes(".ts") || normalized.includes(".py")) {
@@ -394,4 +484,65 @@ function appendConflict(record: MemoryRecord, otherRecordId: string): boolean {
   conflictsWith.push(otherRecordId);
   record.conflictsWith = conflictsWith;
   return true;
+}
+
+function singleRequired(values: Map<string, string[]>, flag: string, errorCode: string): string {
+  const value = singleOptional(values, flag);
+  if (!value) throw new Error(errorCode);
+  return value;
+}
+
+function singleOptional(values: Map<string, string[]>, flag: string): string | undefined {
+  const entries = values.get(flag);
+  return entries?.at(-1);
+}
+
+function buildQuery(input: { scope?: string; text?: string; tags?: string[] }): MemoryQuery | undefined {
+  const query: MemoryQuery = {};
+  if (input.scope) query.scope = input.scope as MemoryQuery["scope"];
+  if (input.text) query.text = input.text;
+  if (input.tags && input.tags.length > 0) query.tags = input.tags;
+  return Object.keys(query).length > 0 ? query : undefined;
+}
+
+function buildMaintenanceOptions(values: Map<string, string[]>): MemoryMaintenanceOptions | undefined {
+  const options: MemoryMaintenanceOptions = {};
+  const now = singleOptional(values, "--now");
+  if (now) options.now = now;
+  const agingAfterDays = singleOptional(values, "--aging-after-days");
+  if (agingAfterDays !== undefined) options.agingAfterDays = parseNumberFlag(agingAfterDays);
+  const staleAfterDays = singleOptional(values, "--stale-after-days");
+  if (staleAfterDays !== undefined) options.staleAfterDays = parseNumberFlag(staleAfterDays);
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+function parseNumberFlag(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error("memory_cli_invalid_number");
+  return parsed;
+}
+
+async function readApplyRequest(cwd: string, requestFile: string): Promise<MemoryMaintenanceApplyRequest> {
+  const absolutePath = resolve(cwd, requestFile);
+  let text: string;
+  try {
+    text = await readFile(absolutePath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error("memory_cli_request_file_not_found");
+    }
+    throw error;
+  }
+  try {
+    return JSON.parse(text) as MemoryMaintenanceApplyRequest;
+  } catch {
+    throw new Error("memory_cli_invalid_request_file_json");
+  }
+}
+
+function normalizeCliError(error: unknown): string {
+  if (error instanceof Error && typeof error.message === "string" && error.message) {
+    return error.message;
+  }
+  return "memory_cli_execution_failed";
 }

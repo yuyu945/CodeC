@@ -18,6 +18,7 @@ The project now has a stable runtime core with:
 - explicit memory maintenance apply path
 - memory product surface facade
 - memory command-runner surface
+- memory argv/bin wrapper
 
 Current repository state:
 
@@ -28,6 +29,7 @@ Current repository state:
 - caller-invoked memory maintenance write-back is implemented
 - a library-level memory product surface is implemented
 - a minimal memory command-runner surface is implemented
+- a minimal shell-facing memory executable entrypoint is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -254,6 +256,24 @@ Memory CLI surface constraints:
 - no automatic maintenance execution is introduced
 - command runner reuses existing memory facade and manager boundaries
 
+### Phase 12: Memory argv/bin Wrapper
+
+Delivered in the working tree:
+
+- `parseMemoryCliArgv()`
+- `executeMemoryCli()`
+- `memory-cli.ts`
+- repo-local `memory` package script
+- deterministic stdout / stderr / exitCode contract
+- relative request-file resolution from `cwd`
+
+Executable wrapper constraints:
+
+- wrapper is minimal and shell-facing, but not a full published npm `bin`
+- output remains JSON-only
+- no interactive UI or autonomous maintenance execution is introduced
+- executable layer remains a thin wrapper over the command-runner
+
 ## Current Test Surface
 
 Test files:
@@ -288,29 +308,30 @@ Covered behavior:
 - caller-invoked memory maintenance persistence
 - library-level memory inspect/analyze/apply facade behavior
 - command-runner memory inspect/analyze/apply behavior
+- shell-facing memory executable wrapper behavior
 
 Current verification status:
 
-- full suite passes locally: `91/91`
+- full suite passes locally: `104/104`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory argv/bin Wrapper`
-   - actual `process.argv` parsing and executable entrypoint
+1. `Memory Human-Facing UX Layer`
+   - readable text output and/or interactive flows on top of JSON/command surfaces
    - still no autonomous background maintenance
 
-Do not start MCP or multi-agent work before the executable memory entrypoint boundary is stabilized.
+Do not start MCP or multi-agent work before the human-facing memory UX boundary is stabilized.
 
 ## Known Constraints
 
 - Event storage remains local JSONL.
 - Memory storage is local JSONL/file-backed and separate from event storage.
-- There is now a minimal memory command-runner surface, but no argv/bin wrapper, TUI, or API.
+- There is now a minimal shell-facing memory executable entrypoint, but no interactive UI or general API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
 - Memory maintenance remains explicit and caller-driven with no autonomous persistence.
 - Memory product surface is still library-only with no user-facing command surface.
-- Memory CLI surface exists only as a programmatic command runner, not a shell-facing executable.
+- Memory command surfaces are JSON-first and not yet optimized for human-readable UX.

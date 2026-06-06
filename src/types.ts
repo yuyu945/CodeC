@@ -262,6 +262,12 @@ export type MemoryCliCommand =
       applyRequest: MemoryMaintenanceApplyRequest;
     };
 
+export interface MemoryCliExecutionResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

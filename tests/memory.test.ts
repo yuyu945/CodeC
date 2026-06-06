@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -12,7 +12,10 @@ import {
   LocalMemorySurface,
   LocalMemoryManager,
   MemoryMaintenanceAnalyzer,
+  executeMemoryCli,
+  parseMemoryCliArgv,
   runMemoryCli,
+  type MemoryCliExecutionResult,
   type MemoryMaintenanceApplyResult,
   type MemoryMaintenanceApplyRequest,
   type MemoryMaintenanceApplyResult as MaintenanceApplyResult,
@@ -1010,4 +1013,177 @@ test("runMemoryCli rejects apply commands without applyRequest deterministically
     runMemoryCli({ type: "apply", cwd } as unknown as MemoryCliCommand),
     /memory_cli_apply_requires_request/,
   );
+});
+
+test("parseMemoryCliArgv parses inspect with query and maintenance flags", () => {
+  const command = parseMemoryCliArgv([
+    "inspect",
+    "--cwd", "D:/workspace",
+    "--scope", "project",
+    "--text", "pnpm",
+    "--tag", "build",
+    "--tag", "test",
+    "--include-maintenance",
+    "--now", "2026-06-06T00:00:00.000Z",
+    "--aging-after-days", "12",
+    "--stale-after-days", "34",
+  ]);
+
+  assert.equal(command.type, "inspect");
+  assert.equal(command.cwd, "D:/workspace");
+  assert.deepEqual(command.query, {
+    scope: "project",
+    text: "pnpm",
+    tags: ["build", "test"],
+  });
+  assert.equal(command.includeMaintenance, true);
+  assert.deepEqual(command.maintenanceOptions, {
+    now: "2026-06-06T00:00:00.000Z",
+    agingAfterDays: 12,
+    staleAfterDays: 34,
+  });
+});
+
+test("parseMemoryCliArgv keeps query.tags undefined when no tag flags are passed", () => {
+  const command = parseMemoryCliArgv([
+    "inspect",
+    "--cwd", "D:/workspace",
+    "--scope", "project",
+  ]);
+
+  assert.equal(command.type, "inspect");
+  assert.deepEqual(command.query, { scope: "project" });
+});
+
+test("parseMemoryCliArgv parses analyze maintenance flags", () => {
+  const command = parseMemoryCliArgv([
+    "analyze",
+    "--cwd", "D:/workspace",
+    "--now", "2026-06-06T00:00:00.000Z",
+    "--aging-after-days", "20",
+  ]);
+
+  assert.equal(command.type, "analyze");
+  assert.equal(command.cwd, "D:/workspace");
+  assert.deepEqual(command.maintenanceOptions, {
+    now: "2026-06-06T00:00:00.000Z",
+    agingAfterDays: 20,
+  });
+});
+
+test("parseMemoryCliArgv parses apply with request file", () => {
+  const command = parseMemoryCliArgv([
+    "apply",
+    "--cwd", "D:/workspace",
+    "--request-file", "requests/apply.json",
+  ]);
+
+  assert.equal(command.type, "apply");
+  assert.equal(command.cwd, "D:/workspace");
+  assert.equal((command as { requestFile?: string }).requestFile, "requests/apply.json");
+});
+
+test("parseMemoryCliArgv rejects unknown subcommands deterministically", () => {
+  assert.throws(
+    () => parseMemoryCliArgv(["unknown", "--cwd", "D:/workspace"]),
+    /unsupported_memory_cli_command/,
+  );
+});
+
+test("parseMemoryCliArgv rejects missing cwd deterministically", () => {
+  assert.throws(
+    () => parseMemoryCliArgv(["inspect"]),
+    /memory_cli_requires_cwd/,
+  );
+});
+
+test("parseMemoryCliArgv rejects missing request file deterministically", () => {
+  assert.throws(
+    () => parseMemoryCliArgv(["apply", "--cwd", "D:/workspace"]),
+    /memory_cli_apply_requires_request_file/,
+  );
+});
+
+test("parseMemoryCliArgv rejects invalid numeric flags deterministically", () => {
+  assert.throws(
+    () => parseMemoryCliArgv(["analyze", "--cwd", "D:/workspace", "--aging-after-days", "abc"]),
+    /memory_cli_invalid_number/,
+  );
+});
+
+test("executeMemoryCli returns stdout JSON and exitCode 0 on success", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({ id: "mem-exec-success" }));
+
+  const result = await executeMemoryCli(["inspect", "--cwd", cwd]);
+
+  assert.equal((result as MemoryCliExecutionResult).exitCode, 0);
+  assert.equal(result.stderr, "");
+  const parsed = JSON.parse(result.stdout);
+  assert.deepEqual(parsed.records.map((record: { id: string }) => record.id), ["mem-exec-success"]);
+});
+
+test("executeMemoryCli resolves request-file relative to cwd", async () => {
+  const cwd = await workspace();
+  const manager = new LocalMemoryManager(new FileMemoryStore(join(cwd, ".memory.jsonl")));
+  await manager.write(projectRecord({
+    id: "mem-exec-apply",
+    metadata: { lastSeenAt: "2026-05-01T00:00:00.000Z" },
+  }));
+
+  const requestDir = resolve(cwd, "requests");
+  const requestPath = join(requestDir, "apply.json");
+  await mkdir(requestDir, { recursive: true });
+  await writeFile(
+    requestPath,
+    `${JSON.stringify({
+      now: "2026-06-06T00:00:00.000Z",
+      freshnessSuggestions: [
+        {
+          recordId: "mem-exec-apply",
+          currentFreshness: "fresh",
+          suggestedFreshness: "aging",
+          reason: "last_seen_threshold_reached",
+        },
+      ],
+    })}\n`,
+    "utf8",
+  );
+
+  const result = await executeMemoryCli(["apply", "--cwd", cwd, "--request-file", "requests/apply.json"]);
+
+  assert.equal(result.exitCode, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.appliedFreshnessCount, 1);
+  assert.equal((await manager.list())[0].freshness, "aging");
+});
+
+test("executeMemoryCli returns deterministic stderr when request file is missing", async () => {
+  const cwd = await workspace();
+  const result = await executeMemoryCli(["apply", "--cwd", cwd, "--request-file", "missing.json"]);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /memory_cli_request_file_not_found/);
+});
+
+test("executeMemoryCli returns deterministic stderr when request file is invalid JSON", async () => {
+  const cwd = await workspace();
+  const requestPath = join(cwd, "invalid.json");
+  await writeFile(requestPath, "{not-json}\n", "utf8");
+
+  const result = await executeMemoryCli(["apply", "--cwd", cwd, "--request-file", "invalid.json"]);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /memory_cli_invalid_request_file_json/);
+});
+
+test("executeMemoryCli does not leak raw exception text in stderr", async () => {
+  const result = await executeMemoryCli(["unsupported", "--cwd", "D:/workspace"]);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr.trim(), "unsupported_memory_cli_command");
 });

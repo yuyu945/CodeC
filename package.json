@@ -4,6 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node --test --experimental-strip-types tests/*.test.ts"
+    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "memory": "node --experimental-strip-types memory-cli.ts"
   }
 }
