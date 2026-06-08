@@ -268,6 +268,33 @@ export interface MemoryCliExecutionResult {
   stderr: string;
 }
 
+export interface MemoryTuiState {
+  records: MemoryRecord[];
+  maintenance: MemoryMaintenanceReport;
+  visibleIssues: MemoryMaintenanceIssue[];
+  visibleFreshnessSuggestions: MemoryFreshnessSuggestion[];
+  selectedIssueKeys: string[];
+  selectedFreshnessRecordIds: string[];
+  scopeFilter?: MemoryScope;
+  textFilter?: string;
+  statusMessage: string;
+}
+
+export interface MemoryTuiResult {
+  applied?: MemoryMaintenanceApplyResult;
+  finalState: MemoryTuiState;
+}
+
+export type MemoryTuiCommand =
+  | { type: "list" }
+  | { type: "analyze" }
+  | { type: "filter_scope"; scope?: MemoryScope }
+  | { type: "filter_text"; text?: string }
+  | { type: "select_issue"; index: number }
+  | { type: "select_freshness"; index: number }
+  | { type: "apply" }
+  | { type: "quit" };
+
 export interface ContextBundle {
   sessionId: string;
   messages: RuntimeMessage[];

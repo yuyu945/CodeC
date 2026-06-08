@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AgentRuntime, ContextBuilder, JsonlEventStore, LocalMemorySurface, PermissionManager, Replay, ToolExecutor, executeMemoryCli, parseMemoryCliArgv, runMemoryCli } from "../src/index.ts";
+import { AgentRuntime, ContextBuilder, JsonlEventStore, LocalMemorySurface, LocalMemoryTuiController, PermissionManager, Replay, ToolExecutor, executeMemoryCli, executeMemoryTuiCommand, parseMemoryCliArgv, parseMemoryTuiCommand, runMemoryCli } from "../src/index.ts";
 import * as runtimeModule from "../src/runtime.ts";
 import * as contextModule from "../src/context.ts";
 import * as eventModule from "../src/events.ts";
@@ -16,20 +16,26 @@ test("split modules remain importable and barrel exports preserve the public sur
   assert.equal(typeof ContextBuilder, "function");
   assert.equal(typeof JsonlEventStore, "function");
   assert.equal(typeof LocalMemorySurface, "function");
+  assert.equal(typeof LocalMemoryTuiController, "function");
   assert.equal(typeof PermissionManager, "function");
   assert.equal(typeof Replay, "function");
   assert.equal(typeof ToolExecutor, "function");
   assert.equal(typeof runMemoryCli, "function");
   assert.equal(typeof parseMemoryCliArgv, "function");
   assert.equal(typeof executeMemoryCli, "function");
+  assert.equal(typeof parseMemoryTuiCommand, "function");
+  assert.equal(typeof executeMemoryTuiCommand, "function");
 
   assert.equal(runtimeModule.AgentRuntime, AgentRuntime);
   assert.equal(contextModule.ContextBuilder, ContextBuilder);
   assert.equal(eventModule.JsonlEventStore, JsonlEventStore);
   assert.equal(memoryModule.LocalMemorySurface, LocalMemorySurface);
+  assert.equal(memoryModule.LocalMemoryTuiController, LocalMemoryTuiController);
   assert.equal(memoryModule.runMemoryCli, runMemoryCli);
   assert.equal(memoryModule.parseMemoryCliArgv, parseMemoryCliArgv);
   assert.equal(memoryModule.executeMemoryCli, executeMemoryCli);
+  assert.equal(memoryModule.parseMemoryTuiCommand, parseMemoryTuiCommand);
+  assert.equal(memoryModule.executeMemoryTuiCommand, executeMemoryTuiCommand);
   assert.equal(permissionModule.PermissionManager, PermissionManager);
   assert.equal(replayModule.Replay, Replay);
   assert.equal(toolModule.ToolExecutor, ToolExecutor);

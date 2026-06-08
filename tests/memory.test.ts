@@ -10,10 +10,13 @@ import {
   FileMemoryStore,
   JsonlEventStore,
   LocalMemorySurface,
+  LocalMemoryTuiController,
   LocalMemoryManager,
   MemoryMaintenanceAnalyzer,
   executeMemoryCli,
+  executeMemoryTuiCommand,
   parseMemoryCliArgv,
+  parseMemoryTuiCommand,
   runMemoryCli,
   type MemoryCliExecutionResult,
   type MemoryMaintenanceApplyResult,
@@ -22,9 +25,12 @@ import {
   type MemoryInspectResult,
   type MemoryMaintenanceReport,
   type MemoryMaintenanceOptions,
+  type MemoryTuiResult,
+  type MemorySurface,
   type MemoryContextPayload,
   type MemoryCliCommand,
   type MemoryManager,
+  type MemoryMaintenanceIssue,
   type MemoryQuery,
   type MemoryRecord,
 } from "../src/index.ts";
@@ -1187,3 +1193,150 @@ test("executeMemoryCli does not leak raw exception text in stderr", async () => 
   assert.equal(result.stdout, "");
   assert.equal(result.stderr.trim(), "unsupported_memory_cli_command");
 });
+
+test("LocalMemoryTuiController load assembles records and visible maintenance items", async () => {
+  const surface = createFakeMemorySurface({
+    inspectRecords: [
+      projectRecord({ id: "mem-visible-a" }),
+      projectRecord({ id: "mem-visible-b" }),
+    ],
+    maintenance: {
+      checkedAt: "2026-06-08T00:00:00.000Z",
+      issues: [
+        { type: "conflict", recordId: "mem-visible-a", otherRecordId: "mem-hidden", reason: "explicit_conflicts_with" },
+      ],
+      freshnessSuggestions: [
+        { recordId: "mem-visible-b", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" },
+        { recordId: "mem-hidden", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" },
+      ],
+    },
+  });
+  const controller = new LocalMemoryTuiController(surface.surface);
+
+  const state = await controller.load();
+
+  assert.deepEqual(state.records.map((record) => record.id), ["mem-visible-a", "mem-visible-b"]);
+  assert.deepEqual(state.visibleIssues.map((issue) => issue.recordId), ["mem-visible-a"]);
+  assert.deepEqual(state.visibleFreshnessSuggestions.map((item) => item.recordId), ["mem-visible-b"]);
+});
+
+test("LocalMemoryTuiController filters affect visible records and visible maintenance", async () => {
+  const surface = createFakeMemorySurface({
+    inspectRecords: [projectRecord({ id: "mem-project-a", content: "Use pnpm test" })],
+    maintenance: {
+      checkedAt: "2026-06-08T00:00:00.000Z",
+      issues: [{ type: "conflict", recordId: "mem-project-a", otherRecordId: "mem-reference-a", reason: "explicit_conflicts_with" }],
+      freshnessSuggestions: [{ recordId: "mem-project-a", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" }],
+    },
+  });
+  const controller = new LocalMemoryTuiController(surface.surface);
+
+  await controller.setScopeFilter("project");
+  const state = await controller.setTextFilter("pnpm");
+
+  assert.deepEqual(surface.inspectRequests, [
+    { query: { scope: "project" }, includeMaintenance: false },
+    { query: { scope: "project", text: "pnpm" }, includeMaintenance: false },
+  ]);
+  assert.deepEqual(state.visibleIssues.map((issue) => issue.recordId), ["mem-project-a"]);
+  assert.deepEqual(state.visibleFreshnessSuggestions.map((item) => item.recordId), ["mem-project-a"]);
+});
+
+test("LocalMemoryTuiController toggles issue and freshness selections by visible index", async () => {
+  const surface = createFakeMemorySurface({
+    inspectRecords: [projectRecord({ id: "mem-a" })],
+    maintenance: {
+      checkedAt: "2026-06-08T00:00:00.000Z",
+      issues: [{ type: "conflict", recordId: "mem-a", otherRecordId: "mem-b", reason: "explicit_conflicts_with" }],
+      freshnessSuggestions: [{ recordId: "mem-a", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" }],
+    },
+  });
+  const controller = new LocalMemoryTuiController(surface.surface);
+  await controller.load();
+
+  const issueState = controller.toggleIssue(0);
+  const freshnessState = controller.toggleFreshness(0);
+
+  assert.equal(issueState.selectedIssueKeys.length, 1);
+  assert.deepEqual(freshnessState.selectedFreshnessRecordIds, ["mem-a"]);
+});
+
+test("LocalMemoryTuiController applySelected no-ops on empty selection", async () => {
+  const surface = createFakeMemorySurface({
+    inspectRecords: [projectRecord({ id: "mem-a" })],
+    maintenance: emptyMaintenanceReport(),
+  });
+  const controller = new LocalMemoryTuiController(surface.surface);
+  await controller.load();
+
+  const result = await controller.applySelected();
+
+  assert.equal(surface.applyRequests.length, 0);
+  assert.equal((result as MemoryTuiResult).applied, undefined);
+  assert.equal(result.finalState.statusMessage, "nothing_selected");
+});
+
+test("LocalMemoryTuiController applySelected forwards only selected items, clears selection, and refreshes", async () => {
+  const surface = createFakeMemorySurface({
+    inspectRecords: [projectRecord({ id: "mem-a" })],
+    maintenance: {
+      checkedAt: "2026-06-08T00:00:00.000Z",
+      issues: [{ type: "conflict", recordId: "mem-a", otherRecordId: "mem-b", reason: "explicit_conflicts_with" }],
+      freshnessSuggestions: [{ recordId: "mem-a", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" }],
+    },
+    applyResult: {
+      appliedAt: "2026-06-08T00:00:00.000Z",
+      appliedConflictCount: 1,
+      appliedFreshnessCount: 1,
+      records: [projectRecord({ id: "mem-a", freshness: "aging" })],
+    },
+  });
+  const controller = new LocalMemoryTuiController(surface.surface);
+  await controller.load();
+  controller.toggleIssue(0);
+  controller.toggleFreshness(0);
+
+  const result = await controller.applySelected();
+
+  assert.deepEqual(surface.applyRequests[0], {
+    issues: [{ type: "conflict", recordId: "mem-a", otherRecordId: "mem-b", reason: "explicit_conflicts_with" }],
+    freshnessSuggestions: [{ recordId: "mem-a", currentFreshness: "fresh", suggestedFreshness: "aging", reason: "last_seen_threshold_reached" }],
+  });
+  assert.deepEqual(result.finalState.selectedIssueKeys, []);
+  assert.deepEqual(result.finalState.selectedFreshnessRecordIds, []);
+  assert.equal(result.finalState.statusMessage, "applied conflicts=1 freshness=1");
+  assert.equal(surface.inspectRequests.length >= 2, true);
+});
+
+function emptyMaintenanceReport(): MemoryMaintenanceReport {
+  return {
+    checkedAt: "2026-06-08T00:00:00.000Z",
+    issues: [],
+    freshnessSuggestions: [],
+  };
+}
+
+function createFakeMemorySurface(options: {
+  inspectRecords: MemoryRecord[];
+  maintenance: MemoryMaintenanceReport;
+  applyResult?: MaintenanceApplyResult;
+}) {
+  const inspectRequests: Array<{ query?: MemoryQuery; includeMaintenance?: boolean; maintenanceOptions?: MemoryMaintenanceOptions }> = [];
+  const analyzeOptions: Array<MemoryMaintenanceOptions | undefined> = [];
+  const applyRequests: Array<MemoryMaintenanceApplyRequest> = [];
+  const surface: MemorySurface = {
+    async inspect(request = {}) {
+      inspectRequests.push(request);
+      return { records: options.inspectRecords, maintenance: request.includeMaintenance ? options.maintenance : undefined };
+    },
+    async analyze(optionsArg) {
+      analyzeOptions.push(optionsArg);
+      return options.maintenance;
+    },
+    async apply(request) {
+      applyRequests.push(request);
+      return options.applyResult ?? emptyApplyResult(options.inspectRecords);
+    },
+  };
+  return { surface, inspectRequests, analyzeOptions, applyRequests };
+}

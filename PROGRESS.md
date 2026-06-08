@@ -19,6 +19,7 @@ The project now has a stable runtime core with:
 - memory product surface facade
 - memory command-runner surface
 - memory argv/bin wrapper
+- memory human-facing TUI
 
 Current repository state:
 
@@ -30,6 +31,7 @@ Current repository state:
 - a library-level memory product surface is implemented
 - a minimal memory command-runner surface is implemented
 - a minimal shell-facing memory executable entrypoint is implemented
+- a minimal local memory TUI is implemented
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -274,6 +276,26 @@ Executable wrapper constraints:
 - no interactive UI or autonomous maintenance execution is introduced
 - executable layer remains a thin wrapper over the command-runner
 
+### Phase 13: Memory Human-Facing TUI
+
+Delivered in the working tree:
+
+- `MemoryTuiState`
+- `MemoryTuiResult`
+- `MemoryTuiCommand`
+- `LocalMemoryTuiController`
+- `parseMemoryTuiCommand()`
+- `executeMemoryTuiCommand()`
+- `memory-tui.ts`
+- repo-local `memory:tui` package script
+
+Memory TUI constraints:
+
+- TUI is minimal and local-only
+- built on Node `readline`, without third-party TUI libraries
+- uses explicit inspect / analyze / apply flows only
+- no autonomous maintenance execution is introduced
+
 ## Current Test Surface
 
 Test files:
@@ -309,29 +331,31 @@ Covered behavior:
 - library-level memory inspect/analyze/apply facade behavior
 - command-runner memory inspect/analyze/apply behavior
 - shell-facing memory executable wrapper behavior
+- local interactive memory TUI behavior
 
 Current verification status:
 
-- full suite passes locally: `104/104`
+- full suite passes locally: `115/115`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory Human-Facing UX Layer`
-   - readable text output and/or interactive flows on top of JSON/command surfaces
+1. `Memory UX Refinement`
+   - improve readability, discoverability, and command ergonomics across CLI/TUI surfaces
    - still no autonomous background maintenance
 
-Do not start MCP or multi-agent work before the human-facing memory UX boundary is stabilized.
+Do not start MCP or multi-agent work before the memory UX boundary is stabilized.
 
 ## Known Constraints
 
 - Event storage remains local JSONL.
 - Memory storage is local JSONL/file-backed and separate from event storage.
-- There is now a minimal shell-facing memory executable entrypoint, but no interactive UI or general API.
+- There is now a minimal shell-facing memory executable entrypoint and a local TUI, but no general API.
 - Design documents remain local reference artifacts and are not part of the committed runtime history by default.
 - Retry count in local observability is intentionally not reported as a derived metric because it is not safely inferable from the current event stream.
 - Memory suggestions remain non-persistent caller-facing outputs.
 - Memory maintenance remains explicit and caller-driven with no autonomous persistence.
 - Memory product surface is still library-only with no user-facing command surface.
 - Memory command surfaces are JSON-first and not yet optimized for human-readable UX.
+- Memory TUI is intentionally minimal and local-only, not a general UI framework.
