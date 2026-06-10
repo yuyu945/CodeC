@@ -25,6 +25,22 @@ async function workspace() {
   return dir;
 }
 
+class CountingApprovalPermissionManager extends PermissionManager {
+  evaluateCalls: Array<{ callId: string; toolName: string }> = [];
+
+  override async evaluate(call: { id: string; name: string }, workspace: { cwd: string }) {
+    this.evaluateCalls.push({ callId: call.id, toolName: call.name });
+    if (call.name === "edit_file") {
+      return {
+        kind: "ask" as const,
+        reason: "edit_requires_approval",
+        snapshot: { cwd: workspace.cwd, policy: "counting-test" },
+      };
+    }
+    return await super.evaluate(call as never, workspace);
+  }
+}
+
 test("runTurn alternates model, tool, typed observation, and final message", async () => {
   const cwd = await workspace();
   const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
@@ -169,6 +185,270 @@ test("permission ask pauses the turn without product UI", async () => {
   assert.equal(result.finalMessage, "");
   assert.equal(result.nextAction?.type, "approval_required");
   assert.equal(await readFile(join(cwd, "notes.txt"), "utf8"), "alpha\nbeta\n");
+});
+
+test("runtime injects actionable invalid tool input errors so the model can self-correct", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  let calls = 0;
+  const runtime = new AgentRuntime({
+    model: {
+      async complete(context): Promise<ModelResponse> {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            toolCalls: [{ id: "call-bad-read", name: "read_file", input: {} }],
+          };
+        }
+        const observation = context.messages.find((message) => message.role === "tool");
+        assert.ok(observation);
+        assert.equal(observation.content.status, "error");
+        assert.equal(observation.content.error, "invalid_read_file_input: expected { path: string }");
+        if (calls === 2) {
+          return {
+            toolCalls: [{ id: "call-good-read", name: "read_file", input: { path: "notes.txt" } }],
+          };
+        }
+        return { finalMessage: "self-corrected" };
+      },
+    },
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 4 },
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "s-self-correct",
+    userMessage: "read notes even if the first tool input is malformed",
+    workspace: { cwd },
+  });
+
+  assert.equal(result.finalMessage, "self-corrected");
+});
+
+test("approval_required stores a pending snapshot with remaining tool calls and emits approval events", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  const permissionManager = new CountingApprovalPermissionManager();
+  const runtime = new AgentRuntime({
+    model: {
+      async complete(): Promise<ModelResponse> {
+        return {
+          toolCalls: [
+            { id: "call-edit-pending", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } },
+            { id: "call-read-pending", name: "read_file", input: { path: "notes.txt" } },
+          ],
+          memorySuggestions: [suggestion("pending snapshot memory")],
+        };
+      },
+    },
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager,
+    toolExecutor: new ToolExecutor(),
+  });
+
+  const result = await runtime.runTurn({
+    sessionId: "s-pending",
+    userMessage: "edit then read",
+    workspace: { cwd },
+  });
+
+  assert.equal(result.nextAction?.type, "approval_required");
+  assert.equal(result.nextAction?.approvalId, "approval-call-edit-pending");
+  assert.deepEqual(permissionManager.evaluateCalls, [{ callId: "call-edit-pending", toolName: "edit_file" }]);
+  assert.deepEqual(result.memorySuggestions?.map((item) => item.content), ["pending snapshot memory"]);
+
+  const pending = runtime.getPendingApproval("s-pending");
+  assert.ok(pending);
+  assert.equal(pending.approvalId, "approval-call-edit-pending");
+  assert.equal(pending.request.sessionId, "s-pending");
+  assert.equal(pending.request.workspace.cwd, cwd);
+  assert.equal(pending.iteration, 0);
+  assert.equal(pending.pendingCall.id, "call-edit-pending");
+  assert.deepEqual(pending.remainingToolCalls.map((call) => call.id), ["call-read-pending"]);
+  assert.deepEqual(pending.memorySuggestions.map((item) => item.content), ["pending snapshot memory"]);
+  assert.equal(await readFile(join(cwd, "notes.txt"), "utf8"), "alpha\nbeta\n");
+
+  const events = await eventStore.forSession("s-pending");
+  assert.equal(events.at(-1)?.type, "ApprovalPending");
+});
+
+test("resumeAfterApproval allow executes the pending call without re-evaluating permissions and preserves tool order", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  const permissionManager = new CountingApprovalPermissionManager();
+  let modelCalls = 0;
+  const runtime = new AgentRuntime({
+    model: {
+      async complete(context): Promise<ModelResponse> {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            toolCalls: [
+              { id: "call-edit-allow", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } },
+              { id: "call-read-allow", name: "read_file", input: { path: "notes.txt" } },
+            ],
+            memorySuggestions: [suggestion("before approval"), suggestion("before approval second")],
+          };
+        }
+        const toolMessages = context.messages.filter((message) => message.role === "tool");
+        assert.deepEqual(toolMessages.map((message) => message.content.callId), ["call-edit-allow", "call-read-allow"]);
+        return {
+          finalMessage: "allow resumed",
+          memorySuggestions: [suggestion("after approval")],
+        };
+      },
+    },
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager,
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 4 },
+  });
+
+  const initial = await runtime.runTurn({
+    sessionId: "s-allow",
+    userMessage: "edit then read",
+    workspace: { cwd },
+  });
+  assert.equal(initial.nextAction?.type, "approval_required");
+
+  const resumed = await runtime.resumeAfterApproval({
+    sessionId: "s-allow",
+    approvalId: "approval-call-edit-allow",
+    resolution: "allow",
+  });
+
+  assert.equal(resumed.finalMessage, "allow resumed");
+  assert.equal(resumed.finishReason, "final_message");
+  assert.deepEqual(permissionManager.evaluateCalls, [
+    { callId: "call-edit-allow", toolName: "edit_file" },
+    { callId: "call-read-allow", toolName: "read_file" },
+  ]);
+  assert.equal(runtime.getPendingApproval("s-allow"), undefined);
+  assert.equal(await readFile(join(cwd, "notes.txt"), "utf8"), "changed\n");
+  assert.deepEqual(resumed.memorySuggestions?.map((item) => item.content), ["before approval", "before approval second", "after approval"]);
+
+  const events = await eventStore.forSession("s-allow");
+  assert.deepEqual(
+    events.filter((event) => event.type === "ApprovalPending" || event.type === "ApprovalResolved" || event.type === "TurnResumed").map((event) => event.type),
+    ["ApprovalPending", "ApprovalResolved", "TurnResumed"],
+  );
+});
+
+test("resumeAfterApproval deny injects a permission error, continues remaining tool calls, and leaves the file unchanged", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  const permissionManager = new CountingApprovalPermissionManager();
+  let modelCalls = 0;
+  const runtime = new AgentRuntime({
+    model: {
+      async complete(context): Promise<ModelResponse> {
+        modelCalls += 1;
+        if (modelCalls === 1) {
+          return {
+            toolCalls: [
+              { id: "call-edit-deny", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } },
+              { id: "call-read-deny", name: "read_file", input: { path: "notes.txt" } },
+            ],
+          };
+        }
+        const toolMessages = context.messages.filter((message) => message.role === "tool");
+        assert.deepEqual(toolMessages.map((message) => [message.content.callId, message.content.status]), [
+          ["call-edit-deny", "error"],
+          ["call-read-deny", "ok"],
+        ]);
+        assert.equal(toolMessages[0].content.error, "permission_denied");
+        return { finalMessage: "deny resumed" };
+      },
+    },
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager,
+    toolExecutor: new ToolExecutor(),
+    limits: { maxToolIterations: 4 },
+  });
+
+  const initial = await runtime.runTurn({
+    sessionId: "s-deny-resume",
+    userMessage: "edit then read",
+    workspace: { cwd },
+  });
+  assert.equal(initial.nextAction?.type, "approval_required");
+
+  const resumed = await runtime.resumeAfterApproval({
+    sessionId: "s-deny-resume",
+    approvalId: "approval-call-edit-deny",
+    resolution: "deny",
+  });
+
+  assert.equal(resumed.finalMessage, "deny resumed");
+  assert.equal(await readFile(join(cwd, "notes.txt"), "utf8"), "alpha\nbeta\n");
+  assert.deepEqual(permissionManager.evaluateCalls, [
+    { callId: "call-edit-deny", toolName: "edit_file" },
+    { callId: "call-read-deny", toolName: "read_file" },
+  ]);
+});
+
+test("resumeAfterApproval returns deterministic results for invalid or repeated resume attempts", async () => {
+  const cwd = await workspace();
+  const eventStore = new JsonlEventStore(join(cwd, ".events.jsonl"));
+  let modelCalls = 0;
+  const runtime = new AgentRuntime({
+    model: {
+      async complete(): Promise<ModelResponse> {
+        modelCalls += 1;
+        if (modelCalls > 1) return { finalMessage: "done after denial" };
+        return {
+          toolCalls: [{ id: "call-edit-repeat", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } }],
+        };
+      },
+    },
+    eventStore,
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  });
+
+  const missing = await runtime.resumeAfterApproval({
+    sessionId: "missing-session",
+    approvalId: "approval-missing",
+    resolution: "allow",
+  });
+  assert.equal(missing.finalMessage, "Cannot resume: no pending approval for session missing-session.");
+  assert.equal(missing.nextAction, undefined);
+
+  const initial = await runtime.runTurn({
+    sessionId: "s-repeat",
+    userMessage: "edit once",
+    workspace: { cwd },
+  });
+  assert.equal(initial.nextAction?.type, "approval_required");
+
+  const wrongId = await runtime.resumeAfterApproval({
+    sessionId: "s-repeat",
+    approvalId: "approval-other",
+    resolution: "allow",
+  });
+  assert.equal(wrongId.finalMessage, "Cannot resume: approval approval-other does not match pending approval for session s-repeat.");
+
+  const resumed = await runtime.resumeAfterApproval({
+    sessionId: "s-repeat",
+    approvalId: "approval-call-edit-repeat",
+    resolution: "deny",
+  });
+  assert.equal(resumed.finalMessage, "done after denial");
+  assert.equal(resumed.nextAction, undefined);
+
+  const repeated = await runtime.resumeAfterApproval({
+    sessionId: "s-repeat",
+    approvalId: "approval-call-edit-repeat",
+    resolution: "deny",
+  });
+  assert.equal(repeated.finalMessage, "Cannot resume: no pending approval for session s-repeat.");
 });
 
 test("max tool iteration limit stops repeated tool calls", async () => {

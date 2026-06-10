@@ -1,6 +1,6 @@
 # Progress
 
-Last updated: 2026-06-05
+Last updated: 2026-06-10
 
 ## Status
 
@@ -20,6 +20,9 @@ The project now has a stable runtime core with:
 - memory command-runner surface
 - memory argv/bin wrapper
 - memory human-facing TUI
+- agent REPL main application shell
+- single-session approval resume for in-flight turns
+- agent REPL UX refinement for transcript readability and command discoverability
 
 Current repository state:
 
@@ -32,6 +35,9 @@ Current repository state:
 - a minimal memory command-runner surface is implemented
 - a minimal shell-facing memory executable entrypoint is implemented
 - a minimal local memory TUI is implemented
+- a minimal agent-facing REPL executable entrypoint is implemented
+- in-process approval pause/resume is implemented for the main agent loop
+- REPL transcript/status/approval/provider-diagnosis output is now formatted for human scanning
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -296,6 +302,53 @@ Memory TUI constraints:
 - uses explicit inspect / analyze / apply flows only
 - no autonomous maintenance execution is introduced
 
+### Phase 14: Agent REPL Main Route
+
+Delivered in the working tree:
+
+- `PendingApprovalSnapshot`
+- `ApprovalResumeRequest`
+- `AgentRuntime.resumeAfterApproval()`
+- approval-related `AgentEvent` additions:
+  - `ApprovalPending`
+  - `ApprovalResolved`
+  - `TurnResumed`
+- `parseAgentCliArgv()`
+- `runAgentRepl()`
+- `executeAgentCli()`
+- `agent-cli.ts`
+- repo-local `agent` package script
+
+Agent REPL constraints:
+
+- REPL is the primary application shell, but remains local terminal-only
+- approval resume is single-process, single-session, and in-memory only
+- user CLI exposes `openai|anthropic`; `fake` remains test-only through injected seams
+- memory stays internal and is not surfaced as a user-facing REPL product area
+
+### Phase 15: Agent REPL UX Refinement
+
+Delivered in the working tree:
+
+- labeled REPL output channels for:
+  - `system`
+  - `assistant`
+  - `local`
+  - `approval`
+  - `status`
+  - `diagnostics`
+- expanded welcome/help text with command intent
+- multiline `/status` output with stable field labels
+- richer approval pending messaging with tool, target, risk, and next-step guidance
+- structured provider diagnosis output for text/tool compatibility probing
+
+Agent REPL UX constraints:
+
+- UX refinement stays text-only and terminal-local
+- no cross-process approval persistence is introduced
+- no MCP, multi-agent, or new product surface is introduced
+- output improvements remain a thin presentation layer over the existing REPL/runtime boundary
+
 ## Current Test Surface
 
 Test files:
@@ -309,6 +362,7 @@ Test files:
 - `tests/module-exports.test.ts`
 - `tests/observability.test.ts`
 - `tests/memory.test.ts`
+- `tests/agent-cli.test.ts`
 
 Covered behavior:
 
@@ -332,20 +386,24 @@ Covered behavior:
 - command-runner memory inspect/analyze/apply behavior
 - shell-facing memory executable wrapper behavior
 - local interactive memory TUI behavior
+- agent CLI argument parsing and REPL shell behavior
+- approval pending snapshots and same-turn allow/deny resume behavior
+- REPL output labeling and approval/provider-diagnosis readability
 
 Current verification status:
 
-- full suite passes locally: `115/115`
+- full suite passes locally: `136/136`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
-1. `Memory UX Refinement`
-   - improve readability, discoverability, and command ergonomics across CLI/TUI surfaces
-   - still no autonomous background maintenance
+1. `Agent Session Continuation`
+   - consider whether approval recovery or replay should survive process boundaries before widening product scope
+2. `REPL command breadth (only if needed)`
+   - add narrowly scoped local convenience commands without widening runtime architecture
 
-Do not start MCP or multi-agent work before the memory UX boundary is stabilized.
+Do not start MCP or multi-agent work before the agent REPL boundary is stabilized.
 
 ## Known Constraints
 
@@ -359,3 +417,5 @@ Do not start MCP or multi-agent work before the memory UX boundary is stabilized
 - Memory product surface is still library-only with no user-facing command surface.
 - Memory command surfaces are JSON-first and not yet optimized for human-readable UX.
 - Memory TUI is intentionally minimal and local-only, not a general UI framework.
+- Approval resume is not persisted across process restarts.
+- Agent REPL is intentionally single-session and terminal-local, not a general multi-session shell.

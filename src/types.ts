@@ -13,6 +13,12 @@ export interface TurnRequest {
   abortSignal?: AbortSignal;
 }
 
+export interface ApprovalResumeRequest {
+  sessionId: string;
+  approvalId: string;
+  resolution: "allow" | "deny";
+}
+
 export type CompactionTier = "none" | "micro_compact" | "auto_compact" | "reactive_compact" | "snip";
 
 export interface ContextBudgetReport {
@@ -304,6 +310,17 @@ export interface ContextBundle {
   budgetReport: ContextBudgetReport;
 }
 
+export interface PendingApprovalSnapshot {
+  approvalId: string;
+  request: Pick<TurnRequest, "sessionId" | "workspace" | "abortSignal">;
+  context: ContextBundle;
+  iteration: number;
+  pendingCall: ToolCall;
+  remainingToolCalls: ToolCall[];
+  memorySuggestions: MemoryWriteSuggestion[];
+  decision: PermissionDecision;
+}
+
 export interface ModelAdapter {
   readonly provider?: string;
   readonly model?: string;
@@ -342,6 +359,35 @@ export interface AnthropicModelAdapterConfig {
 
 export type ModelAdapterConfig = FakeModelAdapterConfig | OpenAIModelAdapterConfig | AnthropicModelAdapterConfig;
 
+export interface AgentCliOptions {
+  provider: "openai" | "anthropic";
+  model: string;
+  cwd: string;
+  sessionId?: string;
+  eventStorePath?: string;
+  allowEdits: boolean;
+  baseUrl?: string;
+}
+
+export interface AgentCliExecutionResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface ProviderProbeResult {
+  status: "ok" | "failed";
+  code?: string;
+  summary: string;
+}
+
+export interface ProviderCompatibilityReport {
+  textProbe: ProviderProbeResult;
+  toolProbe: ProviderProbeResult;
+  summary: string;
+  details: string[];
+}
+
 export type PermissionDecision =
   | { kind: "allow"; reason: string; snapshot: Record<string, unknown> }
   | { kind: "ask"; reason: string; snapshot: Record<string, unknown> }
@@ -373,6 +419,9 @@ export type AgentEvent =
   | (AgentEventBase & { type: "ModelError"; provider: string; model: string; code: string; message: string })
   | (AgentEventBase & { type: "TurnAborted"; reason: string })
   | (AgentEventBase & { type: "PermissionEvaluated"; callId: string; toolName: string; decision: PermissionDecision["kind"]; reason: string })
+  | (AgentEventBase & { type: "ApprovalPending"; approvalId: string; callId: string; toolName: string; remainingToolCallCount: number })
+  | (AgentEventBase & { type: "ApprovalResolved"; approvalId: string; resolution: ApprovalResumeRequest["resolution"] })
+  | (AgentEventBase & { type: "TurnResumed"; approvalId: string; resumedFromCallId: string; remainingToolCallCount: number })
   | (AgentEventBase & { type: "ToolCallStarted"; callId: string; toolName: string; inputHash: string })
   | (AgentEventBase & { type: "ToolCallFinished"; callId: string; toolName: string; status: "ok" | "error"; durationMs: number; outputHash: string; metadataHash: string; summary: string; errorSummary?: string })
   | (AgentEventBase & { type: "ToolResultInjected"; callId: string; toolName: string; status: "ok" | "error"; observationHash: string; summary: string; errorSummary?: string })
@@ -383,6 +432,7 @@ export interface TurnResult {
   finishReason?: "final_message" | "tool_iteration_limit" | "model_error" | "aborted";
   nextAction?: {
     type: "approval_required";
+    approvalId: string;
     call: ToolCall;
     decision: PermissionDecision;
   };

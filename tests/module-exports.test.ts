@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AgentRuntime, ContextBuilder, JsonlEventStore, LocalMemorySurface, LocalMemoryTuiController, PermissionManager, Replay, ToolExecutor, executeMemoryCli, executeMemoryTuiCommand, parseMemoryCliArgv, parseMemoryTuiCommand, runMemoryCli } from "../src/index.ts";
+import { AgentRuntime, ContextBuilder, JsonlEventStore, LocalMemorySurface, LocalMemoryTuiController, PermissionManager, Replay, ToolExecutor, executeAgentCli, executeMemoryCli, executeMemoryTuiCommand, parseAgentCliArgv, parseMemoryCliArgv, parseMemoryTuiCommand, runAgentRepl, runMemoryCli } from "../src/index.ts";
+import * as agentCliModule from "../src/agent-cli.ts";
 import * as runtimeModule from "../src/runtime.ts";
 import * as contextModule from "../src/context.ts";
 import * as eventModule from "../src/events.ts";
@@ -20,12 +21,18 @@ test("split modules remain importable and barrel exports preserve the public sur
   assert.equal(typeof PermissionManager, "function");
   assert.equal(typeof Replay, "function");
   assert.equal(typeof ToolExecutor, "function");
+  assert.equal(typeof parseAgentCliArgv, "function");
+  assert.equal(typeof executeAgentCli, "function");
+  assert.equal(typeof runAgentRepl, "function");
   assert.equal(typeof runMemoryCli, "function");
   assert.equal(typeof parseMemoryCliArgv, "function");
   assert.equal(typeof executeMemoryCli, "function");
   assert.equal(typeof parseMemoryTuiCommand, "function");
   assert.equal(typeof executeMemoryTuiCommand, "function");
 
+  assert.equal(agentCliModule.parseAgentCliArgv, parseAgentCliArgv);
+  assert.equal(agentCliModule.executeAgentCli, executeAgentCli);
+  assert.equal(agentCliModule.runAgentRepl, runAgentRepl);
   assert.equal(runtimeModule.AgentRuntime, AgentRuntime);
   assert.equal(contextModule.ContextBuilder, ContextBuilder);
   assert.equal(eventModule.JsonlEventStore, JsonlEventStore);

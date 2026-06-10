@@ -1,0 +1,338 @@
+import readline from "node:readline";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { ContextBuilder } from "./context.ts";
+import { JsonlEventStore } from "./events.ts";
+import { createModelAdapter, probeProviderCompatibility } from "./models.ts";
+import { PermissionManager } from "./permissions.ts";
+import { AgentRuntime } from "./runtime.ts";
+import { ToolExecutor } from "./tools.ts";
+import type { AgentCliExecutionResult, AgentCliOptions, ModelAdapter, TurnRequest, TurnResult } from "./types.ts";
+
+type AgentRuntimeLike = Pick<AgentRuntime, "runTurn" | "resumeAfterApproval" | "getPendingApproval">;
+
+type ReplIo = {
+  readLine(): Promise<string | undefined>;
+  write(text: string): void;
+  close?(): void;
+};
+
+type OutputChannel = "system" | "assistant" | "local" | "approval" | "status" | "diagnostics";
+
+export function parseAgentCliArgv(argv: string[]): AgentCliOptions {
+  const values = new Map<string, string[]>();
+  const flags = new Set<string>();
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index];
+    if (!token.startsWith("--")) throw new Error("agent_cli_invalid_flag");
+    if (token === "--allow-edits") {
+      flags.add(token);
+      continue;
+    }
+    const value = argv[index + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error("agent_cli_missing_flag_value");
+    const existing = values.get(token) ?? [];
+    existing.push(value);
+    values.set(token, existing);
+    index += 1;
+  }
+
+  const provider = singleRequired(values, "--provider", "agent_cli_requires_provider");
+  if (provider !== "openai" && provider !== "anthropic") throw new Error("agent_cli_invalid_provider");
+  const model = singleRequired(values, "--model", "agent_cli_requires_model");
+  return {
+    provider,
+    model,
+    cwd: singleOptional(values, "--cwd") ?? process.cwd(),
+    sessionId: singleOptional(values, "--session-id"),
+    eventStorePath: singleOptional(values, "--event-store-path"),
+    allowEdits: flags.has("--allow-edits"),
+    baseUrl: singleOptional(values, "--base-url"),
+  };
+}
+
+export async function executeAgentCli(
+  argv: string[],
+  deps: {
+    io?: ReplIo;
+    runtimeFactory?: (options: AgentCliOptions, model: ModelAdapter) => AgentRuntimeLike;
+    modelAdapterFactory?: (config: { provider: "openai" | "anthropic"; model: string; baseUrl?: string }) => ModelAdapter;
+    sessionIdFactory?: () => string;
+  } = {},
+): Promise<AgentCliExecutionResult> {
+  try {
+    const options = parseAgentCliArgv(argv);
+    if (!deps.io) {
+      const result = await runAgentRepl(options, deps);
+      return { exitCode: result.exitCode, stdout: "", stderr: "" };
+    }
+
+    const stdout: string[] = [];
+    const result = await runAgentRepl(options, {
+      ...deps,
+      io: {
+        ...deps.io,
+        write(text: string) {
+          stdout.push(text);
+          deps.io?.write(text);
+        },
+      },
+    });
+    return { exitCode: result.exitCode, stdout: stdout.join(""), stderr: "" };
+  } catch (error) {
+    const message = normalizeCliError(error);
+    return { exitCode: 1, stdout: "", stderr: `${message}\n` };
+  }
+}
+
+export async function runAgentRepl(
+  options: AgentCliOptions,
+  deps: {
+    io?: ReplIo;
+    runtimeFactory?: (options: AgentCliOptions, model: ModelAdapter) => AgentRuntimeLike;
+    modelAdapterFactory?: (config: { provider: "openai" | "anthropic"; model: string; baseUrl?: string }) => ModelAdapter;
+    sessionIdFactory?: () => string;
+  } = {},
+): Promise<{ exitCode: number; sessionId: string }> {
+  const sessionId = options.sessionId ?? deps.sessionIdFactory?.() ?? crypto.randomUUID();
+  const io = deps.io ?? createReadlineIo();
+  const cwd = options.cwd;
+  let runtime: AgentRuntimeLike | undefined;
+  let adapter: ModelAdapter | undefined;
+
+  function getAdapter(): ModelAdapter {
+    adapter ??= (deps.modelAdapterFactory ?? ((config) => createModelAdapter(config)))({
+      provider: options.provider,
+      model: options.model,
+      baseUrl: options.baseUrl,
+    });
+    return adapter;
+  }
+
+  function getRuntime(): AgentRuntimeLike {
+    runtime ??= deps.runtimeFactory
+      ? deps.runtimeFactory(options, {
+          provider: "fake",
+          model: "runtime-factory-placeholder",
+          async complete() {
+            return { finalMessage: "" };
+          },
+        })
+      : createRuntime(options, getAdapter());
+    return runtime;
+  }
+
+  writeChannel(io, "system", renderWelcome());
+
+  while (true) {
+    const line = await io.readLine();
+    if (line === undefined) break;
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    if (trimmed === "/exit") break;
+    if (trimmed === "/help") {
+      writeChannel(io, "system", renderHelp());
+      continue;
+    }
+    if (trimmed === "/status") {
+      io.write(
+        renderStatus({
+          provider: options.provider,
+          model: options.model,
+          sessionId,
+          cwd,
+          pendingApproval: runtime?.getPendingApproval(sessionId)?.approvalId,
+        }),
+      );
+      continue;
+    }
+    if (trimmed === "/diagnose-provider") {
+      io.write(renderProviderDiagnosis(await probeProviderCompatibility(getAdapter())));
+      continue;
+    }
+    if (trimmed === "/allow" || trimmed === "/deny") {
+      const activeRuntime = getRuntime();
+      const pending = activeRuntime.getPendingApproval(sessionId);
+      const result = await activeRuntime.resumeAfterApproval({
+        sessionId,
+        approvalId: pending?.approvalId ?? `approval-missing-${sessionId}`,
+        resolution: trimmed === "/allow" ? "allow" : "deny",
+      });
+      writeTurnResult(io, result);
+      continue;
+    }
+
+    const localPackageScripts = await maybeAnswerPackageScriptsLocally(trimmed, cwd);
+    if (localPackageScripts) {
+      writeChannel(io, "local", localPackageScripts);
+      continue;
+    }
+
+    const result = await getRuntime().runTurn({
+      sessionId,
+      userMessage: trimmed,
+      workspace: { cwd },
+    } satisfies TurnRequest);
+    writeTurnResult(io, result);
+  }
+
+  io.close?.();
+  return { exitCode: 0, sessionId };
+}
+
+function createRuntime(options: AgentCliOptions, model: ModelAdapter): AgentRuntime {
+  const eventStorePath = options.eventStorePath ?? join(options.cwd, ".events.jsonl");
+  return new AgentRuntime({
+    model,
+    eventStore: new JsonlEventStore(eventStorePath),
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager({ allowEdits: options.allowEdits }),
+    toolExecutor: new ToolExecutor(),
+    limits: { maxModelRetries: 2, modelRetryDelayMs: 75 },
+  });
+}
+
+function writeTurnResult(io: ReplIo, result: TurnResult): void {
+  if (result.nextAction?.type === "approval_required") {
+    io.write(renderApprovalRequired(result.nextAction.approvalId, result.nextAction.call.name, result.nextAction.call.input));
+  }
+  if (result.finalMessage) {
+    writeChannel(io, "assistant", result.finalMessage);
+  }
+}
+
+function renderWelcome(): string {
+  return ["Agent REPL ready.", "Type a normal message to run a turn.", "Type /help for commands."].join("\n");
+}
+
+function renderHelp(): string {
+  return [
+    "Commands:",
+    "/help              Show available commands",
+    "/status            Show current session state",
+    "/diagnose-provider Probe basic text and tool-call compatibility",
+    "/allow             Approve the pending tool action",
+    "/deny              Reject the pending tool action",
+    "/exit              Exit the REPL",
+  ].join("\n");
+}
+
+function renderStatus(state: {
+  provider: string;
+  model: string;
+  sessionId: string;
+  cwd: string;
+  pendingApproval?: string;
+}): string {
+  return [
+    "[status]",
+    `provider: ${state.provider}`,
+    `model: ${state.model}`,
+    `session_id: ${state.sessionId}`,
+    `cwd: ${state.cwd}`,
+    `pending_approval: ${state.pendingApproval ?? "none"}`,
+  ].join("\n") + "\n";
+}
+
+function renderProviderDiagnosis(report: { summary: string; details: string[] }): string {
+  return [
+    "[diagnostics] Provider diagnosis",
+    `summary: ${report.summary}`,
+    ...report.details,
+  ].join("\n") + "\n";
+}
+
+function createReadlineIo(): ReplIo {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    prompt: "agent> ",
+  });
+  return {
+    async readLine() {
+      return await new Promise<string | undefined>((resolveRead) => {
+        rl.prompt();
+        rl.once("line", (line) => resolveRead(line));
+        rl.once("close", () => resolveRead(undefined));
+      });
+    },
+    write(text: string) {
+      process.stdout.write(text);
+    },
+    close() {
+      rl.close();
+    },
+  };
+}
+
+function singleRequired(values: Map<string, string[]>, key: string, errorCode: string): string {
+  const value = singleOptional(values, key);
+  if (!value) throw new Error(errorCode);
+  return value;
+}
+
+function singleOptional(values: Map<string, string[]>, key: string): string | undefined {
+  const entries = values.get(key);
+  if (!entries || entries.length === 0) return undefined;
+  if (entries.length > 1) throw new Error("agent_cli_duplicate_flag");
+  return entries[0];
+}
+
+function normalizeCliError(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return "agent_cli_failed";
+}
+
+function writeChannel(io: ReplIo, channel: OutputChannel, text: string): void {
+  io.write(`[${channel}] ${text}\n`);
+}
+
+function renderApprovalRequired(approvalId: string, toolName: string, input: Record<string, unknown>): string {
+  const target = describeApprovalTarget(input);
+  const risk = summarizeApprovalRisk(toolName);
+  return [
+    "[approval] Pending tool execution",
+    `approval_id: ${approvalId}`,
+    `tool: ${toolName}`,
+    `target: ${target}`,
+    `risk: ${risk}`,
+    "next: use /allow to run it, or /deny to reject it.",
+  ].join("\n") + "\n";
+}
+
+function describeApprovalTarget(input: Record<string, unknown>): string {
+  if (typeof input.path === "string") return input.path;
+  if (typeof input.command === "string") return input.command;
+  if (typeof input.query === "string") return input.query;
+  return "n/a";
+}
+
+function summarizeApprovalRisk(toolName: string): string {
+  if (toolName === "edit_file") return "writes files in the workspace";
+  if (toolName === "shell") return "runs a shell command in the workspace";
+  return "requires confirmation before execution";
+}
+
+async function maybeAnswerPackageScriptsLocally(userMessage: string, cwd: string): Promise<string | undefined> {
+  if (!isPackageScriptsRequest(userMessage)) return undefined;
+  try {
+    const packageJsonPath = join(cwd, "package.json");
+    const parsed = JSON.parse(await readFile(packageJsonPath, "utf8")) as { scripts?: Record<string, unknown> };
+    const scripts = parsed.scripts && typeof parsed.scripts === "object" ? Object.keys(parsed.scripts) : [];
+    if (scripts.length === 0) return "npm scripts: none";
+    return `npm scripts: ${scripts.join(", ")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function isPackageScriptsRequest(userMessage: string): boolean {
+  const normalized = userMessage.trim().toLowerCase();
+  return (
+    (normalized.includes("package.json") && normalized.includes("script")) ||
+    (normalized.includes("package.json") && normalized.includes("npm")) ||
+    (normalized.includes("读取") && normalized.includes("package.json"))
+  );
+}

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { PermissionManager, ToolExecutor } from "../src/index.ts";
+import { normalizeToolCall, PermissionManager, toolDefinitionsForUserMessage, ToolExecutor } from "../src/index.ts";
 
 async function workspace() {
   const dir = await mkdtemp(join(tmpdir(), "codec-tools-"));
@@ -139,4 +139,31 @@ test("search_text skips ignored directories and large files within a bounded sca
   assert.equal(search.metadata.skippedLargeFiles, 1);
   assert.equal(search.metadata.scannedFiles, 3);
   assert.equal(search.metadata.budgetExceeded, false);
+});
+
+test("toolDefinitionsForUserMessage narrows structure questions to read-only exploration tools", () => {
+  const tools = toolDefinitionsForUserMessage("我的项目结构是什么");
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ["read_file", "search_text"],
+  );
+});
+
+test("normalizeToolCall repairs common nested or aliased tool input shapes", () => {
+  assert.deepEqual(
+    normalizeToolCall({ id: "1", name: "read_file", input: { input: { file: "package.json" } } }),
+    { id: "1", name: "read_file", input: { path: "package.json" } },
+  );
+  assert.deepEqual(
+    normalizeToolCall({ id: "2", name: "search_text", input: { query: "needle", file: "." } }),
+    { id: "2", name: "search_text", input: { pattern: "needle", path: "." } },
+  );
+  assert.deepEqual(
+    normalizeToolCall({ id: "3", name: "shell", input: { cmd: "node --version" } }),
+    { id: "3", name: "shell", input: { command: "node --version" } },
+  );
+  assert.deepEqual(
+    normalizeToolCall({ id: "4", name: "edit_file", input: { filepath: "file.txt", text: "updated\n" } }),
+    { id: "4", name: "edit_file", input: { path: "file.txt", content: "updated\n" } },
+  );
 });

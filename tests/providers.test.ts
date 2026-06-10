@@ -13,6 +13,7 @@ import {
   FakeModelAdapter,
   JsonlEventStore,
   PermissionManager,
+  probeProviderCompatibility,
   ProviderError,
   ToolExecutor,
   type ContextBundle,
@@ -190,6 +191,10 @@ test("OpenAI Responses adapter maps runtime context and tool definitions into Re
   assert.equal(payload.input[0].role, "system");
   assert.equal(payload.input[1].role, "user");
   assert.equal(payload.tools[0].name, "read_file");
+  assert.equal(payload.tools[0].parameters.type, "object");
+  assert.deepEqual(payload.tools[0].parameters.required, ["path"]);
+  assert.equal(payload.tools[0].parameters.properties.path.type, "string");
+  assert.equal(payload.tools[0].parameters.additionalProperties, false);
 });
 
 test("Anthropic adapter maps runtime context and tool definitions into Messages API payload", async () => {
@@ -232,6 +237,10 @@ test("Anthropic adapter maps runtime context and tool definitions into Messages 
   assert.equal(payload.system, "system rules");
   assert.equal(payload.messages[0].role, "user");
   assert.equal(payload.tools[0].name, "read_file");
+  assert.equal(payload.tools[0].input_schema.type, "object");
+  assert.deepEqual(payload.tools[0].input_schema.required, ["path"]);
+  assert.equal(payload.tools[0].input_schema.properties.path.type, "string");
+  assert.equal(payload.tools[0].input_schema.additionalProperties, false);
 });
 
 test("OpenAI Responses adapter normalizes tool call output", async () => {
@@ -394,6 +403,92 @@ test("Anthropic adapter maps provider errors into canonical taxonomy", async () 
   await assert.rejects(oversizedAdapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_context_too_large");
 });
 
+test("OpenAI-compatible adapter distinguishes auth, explicit balance, forbidden, and generic 403 failures", async () => {
+  const context = {
+    sessionId: "openai-errors",
+    messages: [{ role: "user", content: "hello" }],
+    toolDefinitions: [],
+    budgetReport: { mustCompact: false, messageCount: 1 },
+  };
+
+  const invalidKeyAdapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Incorrect API key provided", type: "invalid_request_error", code: "invalid_api_key" } }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(invalidKeyAdapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_auth_failed");
+
+  const expiredTokenAdapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "该令牌已过期", type: "new_api_error", code: "" } }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(expiredTokenAdapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_auth_failed");
+
+  const explicitBalanceAdapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Insufficient account balance", type: "billing_error", code: "insufficient_balance" } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(explicitBalanceAdapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_balance_failed");
+
+  const ambiguousBalanceTextAdapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Insufficient account balance", type: "bad_response_status_code", code: "bad_response_status_code" } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(
+    ambiguousBalanceTextAdapter.complete(context),
+    (error: unknown) => error instanceof ProviderError && error.code === "provider_request_failed",
+  );
+
+  const forbiddenAdapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Tool use is not allowed for this model route", type: "forbidden", code: "forbidden" } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(forbiddenAdapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_forbidden");
+
+  const generic403Adapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Request blocked by upstream gateway", type: "gateway_error", code: "gateway_error" } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(generic403Adapter.complete(context), (error: unknown) => error instanceof ProviderError && error.code === "provider_request_failed");
+
+  const proxy403Adapter = createOpenAIResponsesAdapter(
+    { provider: "openai", model: "gpt-5-mini", apiKey: "test-key" },
+    async () =>
+      new Response(
+        JSON.stringify({ error: { message: "Insufficient account balance", type: "bad_response_status_code", code: "bad_response_status_code" } }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+  );
+  await assert.rejects(
+    proxy403Adapter.complete(context),
+    (error: unknown) =>
+      error instanceof ProviderError && error.code === "provider_request_failed" && error.retryable === true,
+  );
+});
+
 test("AgentRuntime converts provider errors into typed events and a model_error finish reason", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "codec-provider-error-"));
   await writeFile(join(cwd, "notes.txt"), "alpha\n");
@@ -424,6 +519,57 @@ test("AgentRuntime converts provider errors into typed events and a model_error 
     events.map((event) => event.type),
     ["UserMessage", "ContextBuilt", "InstructionsResolved", "ModelRequestStarted", "ModelError", "AgentFinished"],
   );
+});
+
+test("AgentRuntime uses short user-facing summaries for provider auth, balance, and forbidden errors", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "codec-provider-summary-"));
+  await writeFile(join(cwd, "notes.txt"), "alpha\n");
+
+  const authResult = await new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      error: new ProviderError("OpenAI responses request failed with 401: incorrect api key sk-test-123", "provider_auth_failed"),
+    }),
+    eventStore: new JsonlEventStore(join(cwd, ".events-auth.jsonl")),
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  }).runTurn({
+    sessionId: "provider-auth-summary",
+    userMessage: "hello",
+    workspace: { cwd },
+  });
+  assert.equal(authResult.finalMessage, "Stopped: model error (provider_auth_failed). Provider authentication failed. Check OPENAI_API_KEY or proxy token.");
+  assert.doesNotMatch(authResult.finalMessage, /sk-test-123/);
+
+  const balanceResult = await new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      error: new ProviderError("OpenAI responses request failed with 403: insufficient account balance", "provider_balance_failed"),
+    }),
+    eventStore: new JsonlEventStore(join(cwd, ".events-balance.jsonl")),
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  }).runTurn({
+    sessionId: "provider-balance-summary",
+    userMessage: "hello",
+    workspace: { cwd },
+  });
+  assert.equal(balanceResult.finalMessage, "Stopped: model error (provider_balance_failed). Provider account balance is insufficient.");
+
+  const forbiddenResult = await new AgentRuntime({
+    model: new FakeModelAdapter([], {
+      error: new ProviderError("OpenAI responses request failed with 403: tool use is not allowed for this model route", "provider_forbidden"),
+    }),
+    eventStore: new JsonlEventStore(join(cwd, ".events-forbidden.jsonl")),
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  }).runTurn({
+    sessionId: "provider-forbidden-summary",
+    userMessage: "hello",
+    workspace: { cwd },
+  });
+  assert.equal(forbiddenResult.finalMessage, "Stopped: model error (provider_forbidden). Provider rejected this request for the selected model or route.");
 });
 
 test("AgentRuntime retries retryable provider errors and succeeds within retry budget", async () => {
@@ -534,4 +680,35 @@ test("AgentRuntime respects an already-aborted request signal", async () => {
 
   const events = await eventStore.forSession("provider-abort");
   assert.deepEqual(events.map((event) => event.type), ["UserMessage", "TurnAborted", "AgentFinished"]);
+});
+
+test("probeProviderCompatibility reports when basic chat works but tool-capable requests fail", async () => {
+  let calls = 0;
+  const adapter = new FakeModelAdapter([], {
+    responder: async (request) => {
+      calls += 1;
+      if (request.toolDefinitions.length === 0) return { finalMessage: "hello" };
+      throw new ProviderError("tool route blocked", "provider_forbidden");
+    },
+  });
+
+  const report = await probeProviderCompatibility(adapter);
+
+  assert.equal(calls, 2);
+  assert.equal(report.textProbe.status, "ok");
+  assert.equal(report.toolProbe.status, "failed");
+  assert.equal(report.toolProbe.code, "provider_forbidden");
+  assert.equal(report.summary, "Basic chat works, but tool-capable provider requests are failing on this route.");
+});
+
+test("probeProviderCompatibility reports when both probe types fail before agent execution", async () => {
+  const adapter = new FakeModelAdapter([], {
+    error: new ProviderError("proxy unstable", "provider_request_failed"),
+  });
+
+  const report = await probeProviderCompatibility(adapter);
+
+  assert.equal(report.textProbe.status, "failed");
+  assert.equal(report.toolProbe.status, "failed");
+  assert.equal(report.summary, "Provider route is failing before agent/tool execution. Check authentication, proxy route, or upstream availability.");
 });

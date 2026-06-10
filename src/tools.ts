@@ -125,11 +125,100 @@ export class ToolExecutor {
 
 export function toolDefinitions(): ToolDefinition[] {
   return [
-    { name: "shell", description: "Run an approved read-only shell command in the workspace.", inputSchema: { command: "string" } },
-    { name: "read_file", description: "Read a UTF-8 file inside the workspace.", inputSchema: { path: "string" } },
-    { name: "edit_file", description: "Replace a UTF-8 file inside the workspace.", inputSchema: { path: "string", content: "string" } },
-    { name: "search_text", description: "Search workspace files for literal text.", inputSchema: { pattern: "string", path: "string?" } },
+    {
+      name: "shell",
+      description: "Run an approved read-only shell command in the workspace.",
+      inputSchema: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "read_file",
+      description: "Read a UTF-8 file inside the workspace.",
+      inputSchema: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "edit_file",
+      description: "Replace a UTF-8 file inside the workspace.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "search_text",
+      description: "Search workspace files for literal text.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string" },
+        },
+        required: ["pattern"],
+        additionalProperties: false,
+      },
+    },
   ];
+}
+
+export function toolDefinitionsForUserMessage(userMessage: string): ToolDefinition[] {
+  const normalized = userMessage.trim().toLowerCase();
+  const all = toolDefinitions();
+
+  if (isLikelyReadFileOnlyRequest(normalized)) {
+    return all.filter((tool) => tool.name === "read_file");
+  }
+  if (isLikelyStructureReadRequest(normalized)) {
+    return all.filter((tool) => tool.name === "read_file" || tool.name === "search_text");
+  }
+
+  return all;
+}
+
+export function normalizeToolCall(call: ToolCall): ToolCall {
+  const baseInput =
+    call.input && typeof call.input === "object" && !Array.isArray(call.input) && call.input.input && typeof call.input.input === "object"
+      ? (call.input.input as Record<string, unknown>)
+      : call.input;
+
+  if (call.name === "read_file") {
+    return { ...call, input: { path: firstStringLike(baseInput, ["path", "file", "filepath", "filename"]) } };
+  }
+  if (call.name === "search_text") {
+    return {
+      ...call,
+      input: {
+        pattern: firstStringLike(baseInput, ["pattern", "query", "text", "needle"]),
+        path: firstStringLike(baseInput, ["path", "file", "filepath", "directory"]),
+      },
+    };
+  }
+  if (call.name === "shell") {
+    return { ...call, input: { command: firstStringLike(baseInput, ["command", "cmd", "script"]) } };
+  }
+  if (call.name === "edit_file") {
+    return {
+      ...call,
+      input: {
+        path: firstStringLike(baseInput, ["path", "file", "filepath", "filename"]),
+        content: firstStringLike(baseInput, ["content", "text", "contents", "value"]),
+      },
+    };
+  }
+  return call;
 }
 
 export function validateToolCall(call: ToolCall): string | undefined {
@@ -158,6 +247,65 @@ export function isDeniedShell(command: string): boolean {
   return /\b(rm|del|erase|rmdir|move|mv|copy|cp|curl|wget|ssh|scp|git\s+(reset|clean|push|commit|checkout|switch|merge|rebase)|set-content|out-file|new-item|remove-item)\b/.test(
     lowered,
   );
+}
+
+function isLikelyReadFileOnlyRequest(message: string): boolean {
+  const asksForScripts =
+    (message.includes("package.json") && message.includes("script")) ||
+    (message.includes("package.json") && message.includes("npm")) ||
+    (message.includes("读取") && message.includes("package.json")) ||
+    (message.includes("read") && message.includes("package.json"));
+  const asksForSearch = message.includes("search") || message.includes("grep") || message.includes("查找") || message.includes("搜索");
+  const asksForEdit =
+    message.includes("edit") ||
+    message.includes("write") ||
+    message.includes("replace") ||
+    message.includes("修改") ||
+    message.includes("写入") ||
+    message.includes("更新");
+  const asksForShell =
+    message.includes("shell") ||
+    message.includes("command") ||
+    message.includes("运行") ||
+    message.includes("执行") ||
+    message.includes("npm run") ||
+    message.includes("node ");
+
+  return asksForScripts && !asksForSearch && !asksForEdit && !asksForShell;
+}
+
+function isLikelyStructureReadRequest(message: string): boolean {
+  const asksForStructure =
+    message.includes("项目结构") ||
+    message.includes("目录树") ||
+    message.includes("仓库结构") ||
+    message.includes("有哪些文件") ||
+    message.includes("入口文件") ||
+    message.includes("project structure") ||
+    message.includes("directory tree") ||
+    message.includes("repo structure") ||
+    message.includes("repository structure");
+  const asksForEdit =
+    message.includes("edit") ||
+    message.includes("write") ||
+    message.includes("replace") ||
+    message.includes("淇敼") ||
+    message.includes("鍐欏叆");
+  const asksForShell =
+    message.includes("shell") ||
+    message.includes("command") ||
+    message.includes("杩愯") ||
+    message.includes("鎵ц");
+  return asksForStructure && !asksForEdit && !asksForShell;
+}
+
+function firstStringLike(input: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+  }
+  return undefined;
 }
 
 async function runShell(command: string, cwd: string, timeoutMs: number, outputLimit: number) {

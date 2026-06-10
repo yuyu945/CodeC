@@ -6,6 +6,8 @@ import type {
   ModelRequest,
   ModelResponse,
   OpenAIModelAdapterConfig,
+  ProviderCompatibilityReport,
+  ProviderProbeResult,
 } from "./types.ts";
 import { capString } from "./shared.ts";
 
@@ -90,7 +92,11 @@ export class OpenAIResponsesAdapter implements ModelAdapter {
       },
       body: JSON.stringify(toOpenAIRequest(this.model, request)),
     }).catch((error) => {
-      throw new ProviderError(redactProviderMessage(error instanceof Error ? error.message : String(error)));
+      throw new ProviderError(
+        redactProviderMessage(error instanceof Error ? error.message : String(error)),
+        "provider_request_failed",
+        true,
+      );
     });
 
     if (!response.ok) {
@@ -151,7 +157,11 @@ export class AnthropicAdapter implements ModelAdapter {
       },
       body: JSON.stringify(toAnthropicRequest(this.model, this.maxTokens, request)),
     }).catch((error) => {
-      throw new ProviderError(redactProviderMessage(error instanceof Error ? error.message : String(error)));
+      throw new ProviderError(
+        redactProviderMessage(error instanceof Error ? error.message : String(error)),
+        "provider_request_failed",
+        true,
+      );
     });
 
     if (!response.ok) {
@@ -210,6 +220,24 @@ export function createModelAdapter(config: ModelAdapterConfig): ModelAdapter {
   return createAnthropicAdapter(config);
 }
 
+export async function probeProviderCompatibility(adapter: ModelAdapter): Promise<ProviderCompatibilityReport> {
+  const textProbe = await runProbe(adapter, []);
+  const toolProbe = await runProbe(adapter, [
+    {
+      name: "read_file",
+      description: "Read a file",
+      inputSchema: { type: "object", properties: { path: { type: "string" } } },
+    },
+  ]);
+
+  return {
+    textProbe,
+    toolProbe,
+    summary: summarizeProbeReport(textProbe, toolProbe),
+    details: buildProbeDetails(textProbe, toolProbe),
+  };
+}
+
 function resolveApiKey(config: OpenAIModelAdapterConfig & { apiKey?: string }): string {
   if (config.apiKey) return config.apiKey;
   const envName = config.apiKeyEnvVar ?? "OPENAI_API_KEY";
@@ -241,7 +269,7 @@ function toOpenAIRequest(model: string, request: ModelRequest) {
       type: "function",
       name: tool.name,
       description: tool.description,
-      parameters: tool.inputSchema,
+      parameters: normalizeToolInputSchema(tool.inputSchema),
     })),
   };
 }
@@ -318,7 +346,7 @@ function toAnthropicRequest(model: string, maxTokens: number, request: ModelRequ
     tools: request.toolDefinitions.map((tool) => ({
       name: tool.name,
       description: tool.description,
-      input_schema: tool.inputSchema,
+      input_schema: normalizeToolInputSchema(tool.inputSchema),
     })),
   };
 }
@@ -366,8 +394,60 @@ function parseToolArguments(value: unknown): Record<string, unknown> {
   }
 }
 
+function normalizeToolInputSchema(schema: Record<string, unknown>): Record<string, unknown> {
+  if (schema.type === "object" && schema.properties && typeof schema.properties === "object") {
+    return {
+      ...schema,
+      required:
+        Array.isArray(schema.required) && schema.required.every((entry) => typeof entry === "string")
+          ? schema.required
+          : Object.entries(schema.properties as Record<string, unknown>)
+              .filter(([, value]) => !(value && typeof value === "object" && (value as { optional?: unknown }).optional === true))
+              .map(([key]) => key),
+      additionalProperties: typeof schema.additionalProperties === "boolean" ? schema.additionalProperties : false,
+    };
+  }
+
+  const properties = Object.fromEntries(
+    Object.entries(schema).map(([key, value]) => {
+      const rawType = typeof value === "string" ? value : "string";
+      const optional = rawType.endsWith("?");
+      return [key, { type: optional ? rawType.slice(0, -1) : rawType }];
+    }),
+  );
+  const required = Object.entries(schema)
+    .filter(([, value]) => typeof value === "string" && !value.endsWith("?"))
+    .map(([key]) => key);
+
+  return {
+    type: "object",
+    properties,
+    required,
+    additionalProperties: false,
+  };
+}
+
 export function redactProviderMessage(message: string): string {
   return capString(message.replace(/\bsk-[A-Za-z0-9_-]+\b/g, "[REDACTED_API_KEY]"), 500);
+}
+
+export function summarizeProviderErrorCode(code: string): string {
+  if (code === "provider_auth_failed") {
+    return "Provider authentication failed. Check OPENAI_API_KEY or proxy token.";
+  }
+  if (code === "provider_balance_failed") {
+    return "Provider account balance is insufficient.";
+  }
+  if (code === "provider_forbidden") {
+    return "Provider rejected this request for the selected model or route.";
+  }
+  if (code === "provider_rate_limited") {
+    return "Provider rate limit reached. Retry later.";
+  }
+  if (code === "provider_context_too_large") {
+    return "Provider rejected the request because the context is too large.";
+  }
+  return "Provider request failed.";
 }
 
 function estimateBudgetFromChars(request: ModelRequest, limit: number, threshold: number): ContextBudgetReport {
@@ -399,7 +479,42 @@ function classifyOpenAIError(status: number, bodyText: string): { code: string; 
   if (status === 400 && (code === "context_length_exceeded" || message.includes("maximum context length") || message.includes("context length"))) {
     return { code: "provider_context_too_large", retryable: true };
   }
-  if (status === 401 || status === 403) return { code: "provider_auth_failed", retryable: false };
+  if (status === 401) return { code: "provider_auth_failed", retryable: false };
+  if (status === 403) {
+    if (parsed?.error?.type === "bad_response_status_code" || parsed?.error?.code === "bad_response_status_code") {
+      return { code: "provider_request_failed", retryable: true };
+    }
+    const explicitBalanceCode =
+      code === "insufficient_balance" ||
+      code === "billing_error" ||
+      code === "quota_exceeded";
+    const explicitBalanceType =
+      parsed?.error?.type === "billing_error" ||
+      parsed?.error?.type === "insufficient_balance";
+    if ((message.includes("insufficient account balance") || message.includes("余额不足") || message.includes("account balance")) && (explicitBalanceCode || explicitBalanceType)) {
+      return { code: "provider_balance_failed", retryable: false };
+    }
+    if (
+      message.includes("api key") ||
+      message.includes("invalid api key") ||
+      message.includes("token expired") ||
+      message.includes("令牌已过期") ||
+      message.includes("token has expired") ||
+      code === "invalid_api_key"
+    ) {
+      return { code: "provider_auth_failed", retryable: false };
+    }
+    if (
+      message.includes("forbidden") ||
+      message.includes("not allowed") ||
+      message.includes("permission") ||
+      message.includes("model route") ||
+      code === "forbidden"
+    ) {
+      return { code: "provider_forbidden", retryable: false };
+    }
+    return { code: "provider_request_failed", retryable: false };
+  }
   if (status === 429) return { code: "provider_rate_limited", retryable: true };
   return { code: "provider_request_failed", retryable: status >= 500 || status === 429 };
 }
@@ -417,11 +532,60 @@ function classifyAnthropicError(status: number, bodyText: string): { code: strin
   if (status === 400 && (message.includes("prompt is too long") || message.includes("context length") || message.includes("too long"))) {
     return { code: "provider_context_too_large", retryable: true };
   }
-  if (status === 401 || type === "authentication_error" || status === 403) {
+  if (status === 401 || type === "authentication_error") {
     return { code: "provider_auth_failed", retryable: false };
+  }
+  if (status === 403) {
+    if (message.includes("balance")) return { code: "provider_balance_failed", retryable: false };
+    if (message.includes("forbidden") || message.includes("permission") || message.includes("not allowed")) {
+      return { code: "provider_forbidden", retryable: false };
+    }
+    return { code: "provider_request_failed", retryable: false };
   }
   if (status === 429 || type === "rate_limit_error") {
     return { code: "provider_rate_limited", retryable: true };
   }
   return { code: "provider_request_failed", retryable: status >= 500 || status === 429 };
+}
+
+async function runProbe(adapter: ModelAdapter, toolDefinitions: ModelRequest["toolDefinitions"]): Promise<ProviderProbeResult> {
+  try {
+    await adapter.complete({
+      sessionId: `probe-${toolDefinitions.length === 0 ? "text" : "tools"}`,
+      messages: [{ role: "user", content: "hello" }],
+      toolDefinitions,
+      budgetReport: { estimatedUnits: 0, limit: 1, threshold: 1, mustCompact: false, tier: "none" },
+    });
+    return {
+      status: "ok",
+      summary: toolDefinitions.length === 0 ? "Basic text probe succeeded." : "Tool-capable probe succeeded.",
+    };
+  } catch (error) {
+    const providerError = error instanceof ProviderError ? error : new ProviderError(error instanceof Error ? error.message : String(error));
+    return {
+      status: "failed",
+      code: providerError.code,
+      summary: summarizeProviderErrorCode(providerError.code),
+    };
+  }
+}
+
+function summarizeProbeReport(textProbe: ProviderProbeResult, toolProbe: ProviderProbeResult): string {
+  if (textProbe.status === "ok" && toolProbe.status === "ok") {
+    return "Provider supports both basic chat and tool-capable requests.";
+  }
+  if (textProbe.status === "ok" && toolProbe.status === "failed") {
+    return "Basic chat works, but tool-capable provider requests are failing on this route.";
+  }
+  if (textProbe.status === "failed" && toolProbe.status === "failed") {
+    return "Provider route is failing before agent/tool execution. Check authentication, proxy route, or upstream availability.";
+  }
+  return "Provider behavior is inconsistent across probe types.";
+}
+
+function buildProbeDetails(textProbe: ProviderProbeResult, toolProbe: ProviderProbeResult): string[] {
+  return [
+    `textProbe: ${textProbe.status}${textProbe.code ? ` (${textProbe.code})` : ""} - ${textProbe.summary}`,
+    `toolProbe: ${toolProbe.status}${toolProbe.code ? ` (${toolProbe.code})` : ""} - ${toolProbe.summary}`,
+  ];
 }

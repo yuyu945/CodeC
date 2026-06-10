@@ -16,7 +16,7 @@ import type {
   TurnRequest,
 } from "./types.ts";
 import { capString, hashJson, redactSecretsInString, redactStructuredValue, summarizeValue } from "./shared.ts";
-import { toolDefinitions } from "./tools.ts";
+import { toolDefinitionsForUserMessage } from "./tools.ts";
 
 export class ContextBuilder {
   private readonly observations = new Map<string, ToolObservation[]>();
@@ -68,7 +68,7 @@ export class ContextBuilder {
       sessionId: request.sessionId,
       messages: fragmentsToMessages(fragments),
       fragments,
-      toolDefinitions: toolDefinitions(),
+      toolDefinitions: toolDefinitionsForUserMessage(request.userMessage),
       instructions: instructionBundle,
       budgetReport: {
         estimatedUnits: 0,

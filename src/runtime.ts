@@ -2,11 +2,23 @@ import { resolve } from "node:path";
 
 import { ContextBuilder } from "./context.ts";
 import { JsonlEventStore } from "./events.ts";
-import { ProviderError, redactProviderMessage } from "./models.ts";
+import { ProviderError, redactProviderMessage, summarizeProviderErrorCode } from "./models.ts";
 import { PermissionManager } from "./permissions.ts";
 import { hashJson, summarizeValue } from "./shared.ts";
-import { ToolExecutor, validateToolCall } from "./tools.ts";
-import type { CompactionTier, ContextBundle, ContextBudgetReport, ModelAdapter, TurnRequest, TurnResult } from "./types.ts";
+import { normalizeToolCall, ToolExecutor, validateToolCall } from "./tools.ts";
+import type {
+  ApprovalResumeRequest,
+  CompactionTier,
+  ContextBundle,
+  ContextBudgetReport,
+  ModelAdapter,
+  ModelResponse,
+  PendingApprovalSnapshot,
+  ToolCall,
+  ToolResult,
+  TurnRequest,
+  TurnResult,
+} from "./types.ts";
 
 export class AgentRuntime {
   private readonly deps: {
@@ -20,6 +32,7 @@ export class AgentRuntime {
   private readonly maxToolIterations: number;
   private readonly maxModelRetries: number;
   private readonly modelRetryDelayMs: number;
+  private readonly pendingApprovals = new Map<string, PendingApprovalSnapshot>();
 
   constructor(
     deps: {
@@ -38,7 +51,7 @@ export class AgentRuntime {
   }
 
   async runTurn(request: TurnRequest): Promise<TurnResult> {
-    const memorySuggestions: TurnResult["memorySuggestions"] = [];
+    const memorySuggestions: NonNullable<TurnResult["memorySuggestions"]> = [];
     if (request.abortSignal?.aborted) {
       await this.deps.eventStore.append({ type: "UserMessage", sessionId: request.sessionId, text: request.userMessage });
       await this.deps.eventStore.append({
@@ -79,117 +92,124 @@ export class AgentRuntime {
     }
     context = this.refreshBudget(context);
 
-    for (let iteration = 0; iteration < this.maxToolIterations; iteration++) {
-      let microCompactedThisIteration = false;
-      if (this.deps.contextBuilder.shouldMicroCompact(context)) {
-        context = await this.compactContext(context, request, "micro_compact");
-        microCompactedThisIteration = true;
-      }
+    return await this.continueTurn({
+      request: { sessionId: request.sessionId, workspace: request.workspace, abortSignal: request.abortSignal },
+      context,
+      iteration: 0,
+      memorySuggestions,
+    });
+  }
 
-      if (!microCompactedThisIteration && context.budgetReport.mustCompact) {
-        context = await this.compactContext(context, request, "auto_compact");
-      }
+  getPendingApproval(sessionId: string): PendingApprovalSnapshot | undefined {
+    return this.pendingApprovals.get(sessionId);
+  }
 
-      const provider = this.deps.model.provider ?? "unknown";
-      const model = this.deps.model.model ?? "unknown";
-      let response;
-      let finalProviderError: ProviderError | undefined;
-      let reactiveCompactionAttempted = false;
+  async resumeAfterApproval(request: ApprovalResumeRequest): Promise<TurnResult> {
+    const pending = this.pendingApprovals.get(request.sessionId);
+    if (!pending) {
+      return await this.resumeErrorResult(
+        request.sessionId,
+        `Cannot resume: no pending approval for session ${request.sessionId}.`,
+      );
+    }
+    if (pending.approvalId !== request.approvalId) {
+      return await this.resumeErrorResult(
+        request.sessionId,
+        `Cannot resume: approval ${request.approvalId} does not match pending approval for session ${request.sessionId}.`,
+      );
+    }
 
-      for (let attempt = 0; attempt <= this.maxModelRetries; attempt++) {
-        if (request.abortSignal?.aborted) {
-          await this.deps.eventStore.append({
-            type: "TurnAborted",
-            sessionId: request.sessionId,
-            reason: abortReason(request.abortSignal.reason),
-          });
-          await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "aborted" });
+    this.pendingApprovals.delete(request.sessionId);
+    await this.deps.eventStore.append({
+      type: "ApprovalResolved",
+      sessionId: request.sessionId,
+      approvalId: pending.approvalId,
+      resolution: request.resolution,
+    });
+    await this.deps.eventStore.append({
+      type: "TurnResumed",
+      sessionId: request.sessionId,
+      approvalId: pending.approvalId,
+      resumedFromCallId: pending.pendingCall.id,
+      remainingToolCallCount: pending.remainingToolCalls.length,
+    });
+
+    let context = pending.context;
+    if (request.resolution === "allow") {
+      context = await this.executeApprovedCall(context, pending.pendingCall, pending.request.workspace);
+    } else {
+      context = await this.injectPermissionDenied(context, pending.pendingCall, request.sessionId);
+    }
+
+    return await this.continueTurn({
+      request: pending.request,
+      context,
+      iteration: pending.iteration,
+      pendingToolCalls: [...pending.remainingToolCalls],
+      memorySuggestions: [...pending.memorySuggestions],
+    });
+  }
+
+  private async continueTurn(state: {
+    request: Pick<TurnRequest, "sessionId" | "workspace" | "abortSignal">;
+    context: ContextBundle;
+    iteration: number;
+    memorySuggestions: NonNullable<TurnResult["memorySuggestions"]>;
+    pendingToolCalls?: ToolCall[];
+  }): Promise<TurnResult> {
+    let { request, context, memorySuggestions } = state;
+    let queuedToolCalls = state.pendingToolCalls;
+
+    for (let iteration = state.iteration; iteration < this.maxToolIterations; iteration += 1) {
+      if (!queuedToolCalls) {
+        let microCompactedThisIteration = false;
+        if (this.deps.contextBuilder.shouldMicroCompact(context)) {
+          context = await this.compactContext(context, request, "micro_compact");
+          microCompactedThisIteration = true;
+        }
+
+        if (!microCompactedThisIteration && context.budgetReport.mustCompact) {
+          context = await this.compactContext(context, request, "auto_compact");
+        }
+
+        const response = await this.requestModel(context, request, memorySuggestions);
+        if ("error" in response) {
+          await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "model_error" });
           return {
-            finalMessage: `Stopped: aborted. ${abortReason(request.abortSignal.reason)}`,
+            finalMessage: `Stopped: model error (${response.error.code}). ${summarizeProviderErrorCode(response.error.code)}`,
+            finishReason: "model_error",
+            events: await this.deps.eventStore.forSession(request.sessionId),
+            memorySuggestions,
+          };
+        }
+        if (response.aborted) {
+          return {
+            finalMessage: `Stopped: aborted. ${abortReason(request.abortSignal?.reason)}`,
             finishReason: "aborted",
             events: await this.deps.eventStore.forSession(request.sessionId),
             memorySuggestions,
           };
         }
-
-        await this.deps.eventStore.append({
-          type: "ModelRequestStarted",
-          sessionId: request.sessionId,
-          provider,
-          model,
-        });
-
-        try {
-          response = await this.deps.model.complete(context);
-          memorySuggestions.push(...(response.memorySuggestions ?? []));
-          finalProviderError = undefined;
-          break;
-        } catch (error) {
-          const providerError =
-            error instanceof ProviderError ? error : new ProviderError(error instanceof Error ? error.message : String(error));
-          finalProviderError = providerError;
-          await this.deps.eventStore.append({
-            type: "ModelError",
-            sessionId: request.sessionId,
-            provider,
-            model,
-            code: providerError.code,
-            message: redactProviderMessage(providerError.message),
-          });
-          if (providerError.code === "provider_context_too_large" && !reactiveCompactionAttempted) {
-            reactiveCompactionAttempted = true;
-            context = await this.compactContext(context, request, "reactive_compact");
-            if (context.budgetReport.mustCompact) {
-              context = await this.compactContext(context, request, "snip");
-            }
-            attempt -= 1;
-            continue;
-          }
-          if (!providerError.retryable || attempt >= this.maxModelRetries) {
-            break;
-          }
-          await delay(this.modelRetryDelayMs, request.abortSignal);
+        if (response.finalMessage !== undefined) {
+          await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "final_message" });
+          return {
+            finalMessage: response.finalMessage,
+            finishReason: "final_message",
+            events: await this.deps.eventStore.forSession(request.sessionId),
+            memorySuggestions,
+          };
         }
+        queuedToolCalls = response.toolCalls ?? [];
       }
 
-      if (finalProviderError) {
-        await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "model_error" });
-        return {
-          finalMessage: `Stopped: model error (${finalProviderError.code}). ${redactProviderMessage(finalProviderError.message)}`,
-          finishReason: "model_error",
-          events: await this.deps.eventStore.forSession(request.sessionId),
-          memorySuggestions,
-        };
-      }
-
-      await this.deps.eventStore.append({
-        type: "ModelResponseReceived",
-        sessionId: request.sessionId,
-        finalMessage: Boolean(response.finalMessage),
-        toolCallCount: response.toolCalls?.length ?? 0,
-      });
-
-      if (response.finalMessage !== undefined) {
-        await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "final_message" });
-        return {
-          finalMessage: response.finalMessage,
-          finishReason: "final_message",
-          events: await this.deps.eventStore.forSession(request.sessionId),
-          memorySuggestions,
-        };
-      }
-
-      for (const call of response.toolCalls ?? []) {
+      while (queuedToolCalls.length > 0) {
+        const [rawCall, ...remainingToolCalls] = queuedToolCalls;
+        const call = normalizeToolCall(rawCall);
         const validationError = validateToolCall(call);
         if (validationError) {
-          context = this.deps.contextBuilder.injectToolError(context, call, validationError);
-          await this.deps.eventStore.append({
-            type: "ToolResultInjected",
-            sessionId: request.sessionId,
-            callId: call.id,
-            toolName: call.name,
-            status: "error",
-          });
+          context = this.deps.contextBuilder.injectToolError(context, call, formatToolValidationError(validationError));
+          await this.appendToolInjectionEvent(request.sessionId, call, "error", undefined, context);
+          queuedToolCalls = remainingToolCalls;
           continue;
         }
 
@@ -204,63 +224,45 @@ export class AgentRuntime {
         });
 
         if (decision.kind === "deny") {
-          context = this.deps.contextBuilder.injectToolError(context, call, "permission_denied");
-          await this.deps.eventStore.append({
-            type: "ToolResultInjected",
-            sessionId: request.sessionId,
-            callId: call.id,
-            toolName: call.name,
-            status: "error",
-          });
+          context = await this.injectPermissionDenied(context, call, request.sessionId);
+          queuedToolCalls = remainingToolCalls;
           continue;
         }
 
         if (decision.kind === "ask") {
+          const approvalId = `approval-${call.id}`;
+          const pending: PendingApprovalSnapshot = {
+            approvalId,
+            request,
+            context,
+            iteration,
+            pendingCall: call,
+            remainingToolCalls,
+            memorySuggestions: [...memorySuggestions],
+            decision,
+          };
+          this.pendingApprovals.set(request.sessionId, pending);
+          await this.deps.eventStore.append({
+            type: "ApprovalPending",
+            sessionId: request.sessionId,
+            approvalId,
+            callId: call.id,
+            toolName: call.name,
+            remainingToolCallCount: remainingToolCalls.length,
+          });
           return {
             finalMessage: "",
-            nextAction: { type: "approval_required", call, decision },
+            nextAction: { type: "approval_required", approvalId, call, decision },
             events: await this.deps.eventStore.forSession(request.sessionId),
             memorySuggestions,
           };
         }
 
-        await this.deps.eventStore.append({
-          type: "ToolCallStarted",
-          sessionId: request.sessionId,
-          callId: call.id,
-          toolName: call.name,
-          inputHash: hashJson(call.input),
-        });
-        const result = await this.deps.toolExecutor.execute(call, request.workspace);
-        this.deps.contextBuilder.recordTouchedPaths(
-          request.sessionId,
-          extractTouchedPaths(result).map((path) => resolve(request.workspace.cwd, path)),
-        );
-        await this.deps.eventStore.append({
-          type: "ToolCallFinished",
-          sessionId: request.sessionId,
-          callId: call.id,
-          toolName: call.name,
-          status: result.ok ? "ok" : "error",
-          durationMs: result.durationMs,
-          outputHash: hashJson(result.output ?? result.error ?? ""),
-          metadataHash: hashJson(result.metadata),
-          summary: summarizeValue(result.output ?? result.error ?? ""),
-          errorSummary: result.error ? summarizeValue(result.error) : undefined,
-        });
-        context = this.deps.contextBuilder.injectToolResult(context, call, result);
-        const latestObservation = context.messages.at(-1)?.content;
-        await this.deps.eventStore.append({
-          type: "ToolResultInjected",
-          sessionId: request.sessionId,
-          callId: call.id,
-          toolName: call.name,
-          status: result.ok ? "ok" : "error",
-          observationHash: hashJson(latestObservation ?? ""),
-          summary: summarizeValue(latestObservation),
-          errorSummary: result.error ? summarizeValue(result.error) : undefined,
-        });
+        context = await this.executeApprovedCall(context, call, request.workspace);
+        queuedToolCalls = remainingToolCalls;
       }
+
+      queuedToolCalls = undefined;
     }
 
     await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "tool_iteration_limit" });
@@ -272,6 +274,146 @@ export class AgentRuntime {
     };
   }
 
+  private async requestModel(
+    initialContext: ContextBundle,
+    request: Pick<TurnRequest, "sessionId" | "workspace" | "abortSignal">,
+    memorySuggestions: NonNullable<TurnResult["memorySuggestions"]>,
+  ): Promise<(ModelResponse & { aborted?: false }) | { error: ProviderError } | { aborted: true }> {
+    let context = initialContext;
+    const provider = this.deps.model.provider ?? "unknown";
+    const model = this.deps.model.model ?? "unknown";
+    let finalProviderError: ProviderError | undefined;
+    let reactiveCompactionAttempted = false;
+
+    for (let attempt = 0; attempt <= this.maxModelRetries; attempt += 1) {
+      if (request.abortSignal?.aborted) {
+        await this.deps.eventStore.append({
+          type: "TurnAborted",
+          sessionId: request.sessionId,
+          reason: abortReason(request.abortSignal.reason),
+        });
+        await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "aborted" });
+        return { aborted: true };
+      }
+
+      await this.deps.eventStore.append({
+        type: "ModelRequestStarted",
+        sessionId: request.sessionId,
+        provider,
+        model,
+      });
+
+      try {
+        const response = await this.deps.model.complete(context);
+        memorySuggestions.push(...(response.memorySuggestions ?? []));
+        await this.deps.eventStore.append({
+          type: "ModelResponseReceived",
+          sessionId: request.sessionId,
+          finalMessage: Boolean(response.finalMessage),
+          toolCallCount: response.toolCalls?.length ?? 0,
+        });
+        return response;
+      } catch (error) {
+        const providerError =
+          error instanceof ProviderError
+            ? error
+            : new ProviderError(error instanceof Error ? error.message : String(error), "provider_request_failed", true);
+        finalProviderError = providerError;
+        await this.deps.eventStore.append({
+          type: "ModelError",
+          sessionId: request.sessionId,
+          provider,
+          model,
+          code: providerError.code,
+          message: redactProviderMessage(providerError.message),
+        });
+        if (providerError.code === "provider_context_too_large" && !reactiveCompactionAttempted) {
+          reactiveCompactionAttempted = true;
+          context = await this.compactContext(context, request, "reactive_compact");
+          if (context.budgetReport.mustCompact) {
+            context = await this.compactContext(context, request, "snip");
+          }
+          attempt -= 1;
+          continue;
+        }
+        if (!providerError.retryable || attempt >= this.maxModelRetries) {
+          break;
+        }
+        await delay(this.modelRetryDelayMs, request.abortSignal);
+      }
+    }
+
+    return { error: finalProviderError ?? new ProviderError("unknown provider error") };
+  }
+
+  private async injectPermissionDenied(context: ContextBundle, call: ToolCall, sessionId: string): Promise<ContextBundle> {
+    const nextContext = this.deps.contextBuilder.injectToolError(context, call, "permission_denied");
+    await this.appendToolInjectionEvent(sessionId, call, "error", undefined, nextContext);
+    return nextContext;
+  }
+
+  private async executeApprovedCall(
+    context: ContextBundle,
+    call: ToolCall,
+    workspace: TurnRequest["workspace"],
+  ): Promise<ContextBundle> {
+    await this.deps.eventStore.append({
+      type: "ToolCallStarted",
+      sessionId: context.sessionId,
+      callId: call.id,
+      toolName: call.name,
+      inputHash: hashJson(call.input),
+    });
+    const result = await this.deps.toolExecutor.execute(call, workspace);
+    this.deps.contextBuilder.recordTouchedPaths(
+      context.sessionId,
+      extractTouchedPaths(result).map((path) => resolve(workspace.cwd, path)),
+    );
+    await this.deps.eventStore.append({
+      type: "ToolCallFinished",
+      sessionId: context.sessionId,
+      callId: call.id,
+      toolName: call.name,
+      status: result.ok ? "ok" : "error",
+      durationMs: result.durationMs,
+      outputHash: hashJson(result.output ?? result.error ?? ""),
+      metadataHash: hashJson(result.metadata),
+      summary: summarizeValue(result.output ?? result.error ?? ""),
+      errorSummary: result.error ? summarizeValue(result.error) : undefined,
+    });
+    const nextContext = this.deps.contextBuilder.injectToolResult(context, call, result);
+    await this.appendToolInjectionEvent(context.sessionId, call, result.ok ? "ok" : "error", result, nextContext);
+    return nextContext;
+  }
+
+  private async appendToolInjectionEvent(
+    sessionId: string,
+    call: ToolCall,
+    status: "ok" | "error",
+    result?: ToolResult,
+    context?: ContextBundle,
+  ): Promise<void> {
+    const latestObservation = context?.messages.at(-1)?.content;
+    await this.deps.eventStore.append({
+      type: "ToolResultInjected",
+      sessionId,
+      callId: call.id,
+      toolName: call.name,
+      status,
+      observationHash: hashJson(latestObservation ?? ""),
+      summary: summarizeValue(latestObservation),
+      errorSummary: result?.error ? summarizeValue(result.error) : undefined,
+    });
+  }
+
+  private async resumeErrorResult(sessionId: string, finalMessage: string): Promise<TurnResult> {
+    return {
+      finalMessage,
+      events: await this.deps.eventStore.forSession(sessionId),
+      memorySuggestions: [],
+    };
+  }
+
   private refreshBudget(context: ContextBundle): ContextBundle {
     const estimate = typeof this.deps.model.estimateBudget === "function" ? this.deps.model.estimateBudget(context) : fallbackBudgetEstimate(context);
     return {
@@ -280,7 +422,11 @@ export class AgentRuntime {
     };
   }
 
-  private async compactContext(context: ContextBundle, request: TurnRequest, tier: Exclude<CompactionTier, "none">): Promise<ContextBundle> {
+  private async compactContext(
+    context: ContextBundle,
+    request: Pick<TurnRequest, "sessionId" | "workspace" | "abortSignal">,
+    tier: Exclude<CompactionTier, "none">,
+  ): Promise<ContextBundle> {
     if (request.abortSignal?.aborted) {
       await this.deps.eventStore.append({
         type: "TurnAborted",
@@ -316,16 +462,16 @@ function abortReason(reason: unknown): string {
 
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) {
-    await new Promise((resolve) => setTimeout(resolve, ms));
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
     return;
   }
   if (signal.aborted) {
     throw new ProviderError(abortReason(signal.reason), "request_aborted", false);
   }
-  await new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolveDelay, reject) => {
     const timeout = setTimeout(() => {
       signal.removeEventListener("abort", onAbort);
-      resolve();
+      resolveDelay();
     }, ms);
     const onAbort = () => {
       clearTimeout(timeout);
@@ -352,6 +498,14 @@ function fallbackBudgetEstimate(context: ContextBundle): ContextBudgetReport {
     tier: context.budgetReport.tier ?? "none",
     overflowBy: estimatedUnits > limit ? estimatedUnits - limit : 0,
   };
+}
+
+function formatToolValidationError(code: string): string {
+  if (code === "invalid_read_file_input") return "invalid_read_file_input: expected { path: string }";
+  if (code === "invalid_search_text_input") return "invalid_search_text_input: expected { pattern: string, path?: string }";
+  if (code === "invalid_edit_file_input") return "invalid_edit_file_input: expected { path: string, content: string }";
+  if (code === "invalid_shell_input") return "invalid_shell_input: expected { command: string }";
+  return code;
 }
 
 function extractTouchedPaths(result: { output?: unknown }): string[] {
