@@ -23,6 +23,7 @@ The project now has a stable runtime core with:
 - agent REPL main application shell
 - single-session approval resume for in-flight turns
 - agent REPL UX refinement for transcript readability and command discoverability
+- cross-process pending approval session recovery
 
 Current repository state:
 
@@ -38,6 +39,7 @@ Current repository state:
 - a minimal agent-facing REPL executable entrypoint is implemented
 - in-process approval pause/resume is implemented for the main agent loop
 - REPL transcript/status/approval/provider-diagnosis output is now formatted for human scanning
+- pending approval snapshots and session metadata can be recovered across process restarts
 - provider parity across fake, OpenAI, and Anthropic is implemented
 - observability remains local-only and derived from existing events
 - memory remains explicit-write-only and does not auto-persist during normal turns or suggestions
@@ -349,6 +351,27 @@ Agent REPL UX constraints:
 - no MCP, multi-agent, or new product surface is introduced
 - output improvements remain a thin presentation layer over the existing REPL/runtime boundary
 
+### Phase 16: Cross-Process Pending Approval Recovery
+
+Delivered in the working tree:
+
+- `SessionStateStore`
+- `FileSessionStateStore`
+- serializable `PersistedPendingApprovalSnapshot`
+- serializable `PersistedSessionMetadata`
+- persisted `baseUrl` / `eventStorePath` / `allowEdits` session metadata
+- runtime save/load/clear integration for pending approval snapshots
+- event-log consistency rejection for stale or already-resolved approval state
+- REPL `/resume` list and select flows
+- REPL active-session runtime/adapter rebuild on restored session switch
+
+Continuation constraints:
+
+- recovery scope is limited to pending approval sessions
+- store is file-backed and one-JSON-file-per-session, separate from event JSONL
+- generic continuation is still out of scope
+- switching away from an already-active pending session is intentionally rejected
+
 ## Current Test Surface
 
 Test files:
@@ -363,6 +386,7 @@ Test files:
 - `tests/observability.test.ts`
 - `tests/memory.test.ts`
 - `tests/agent-cli.test.ts`
+- `tests/session-state.test.ts`
 
 Covered behavior:
 
@@ -389,17 +413,19 @@ Covered behavior:
 - agent CLI argument parsing and REPL shell behavior
 - approval pending snapshots and same-turn allow/deny resume behavior
 - REPL output labeling and approval/provider-diagnosis readability
+- persisted pending snapshot save/load/clear behavior
+- cross-process restore and REPL `/resume` selection behavior
 
 Current verification status:
 
-- full suite passes locally: `136/136`
+- full suite passes locally: `144/144`
 
 ## Next Recommended Milestone
 
 The next realistic phase is:
 
 1. `Agent Session Continuation`
-   - consider whether approval recovery or replay should survive process boundaries before widening product scope
+   - extend beyond pending approval only if a broader continuation state model is justified
 2. `REPL command breadth (only if needed)`
    - add narrowly scoped local convenience commands without widening runtime architecture
 
@@ -417,5 +443,5 @@ Do not start MCP or multi-agent work before the agent REPL boundary is stabilize
 - Memory product surface is still library-only with no user-facing command surface.
 - Memory command surfaces are JSON-first and not yet optimized for human-readable UX.
 - Memory TUI is intentionally minimal and local-only, not a general UI framework.
-- Approval resume is not persisted across process restarts.
+- Only pending approval recovery is persisted across process restarts.
 - Agent REPL is intentionally single-session and terminal-local, not a general multi-session shell.

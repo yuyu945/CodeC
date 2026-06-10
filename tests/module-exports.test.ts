@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AgentRuntime, ContextBuilder, JsonlEventStore, LocalMemorySurface, LocalMemoryTuiController, PermissionManager, Replay, ToolExecutor, executeAgentCli, executeMemoryCli, executeMemoryTuiCommand, parseAgentCliArgv, parseMemoryCliArgv, parseMemoryTuiCommand, runAgentRepl, runMemoryCli } from "../src/index.ts";
+import { AgentRuntime, ContextBuilder, FileSessionStateStore, JsonlEventStore, LocalMemorySurface, LocalMemoryTuiController, PermissionManager, Replay, ToolExecutor, executeAgentCli, executeMemoryCli, executeMemoryTuiCommand, parseAgentCliArgv, parseMemoryCliArgv, parseMemoryTuiCommand, runAgentRepl, runMemoryCli } from "../src/index.ts";
 import * as agentCliModule from "../src/agent-cli.ts";
 import * as runtimeModule from "../src/runtime.ts";
 import * as contextModule from "../src/context.ts";
@@ -15,6 +15,7 @@ import * as typesModule from "../src/types.ts";
 test("split modules remain importable and barrel exports preserve the public surface", () => {
   assert.equal(typeof AgentRuntime, "function");
   assert.equal(typeof ContextBuilder, "function");
+  assert.equal(typeof FileSessionStateStore, "function");
   assert.equal(typeof JsonlEventStore, "function");
   assert.equal(typeof LocalMemorySurface, "function");
   assert.equal(typeof LocalMemoryTuiController, "function");

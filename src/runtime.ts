@@ -14,6 +14,9 @@ import type {
   ModelAdapter,
   ModelResponse,
   PendingApprovalSnapshot,
+  PersistedPendingApprovalSnapshot,
+  PersistedSessionMetadata,
+  SessionStateStore,
   ToolCall,
   ToolResult,
   TurnRequest,
@@ -24,6 +27,8 @@ export class AgentRuntime {
   private readonly deps: {
     model: ModelAdapter;
     eventStore: JsonlEventStore;
+    sessionStateStore?: SessionStateStore;
+    sessionMetadata?: PersistedSessionMetadata;
     contextBuilder: ContextBuilder;
     permissionManager: PermissionManager;
     toolExecutor: ToolExecutor;
@@ -38,6 +43,8 @@ export class AgentRuntime {
     deps: {
       model: ModelAdapter;
       eventStore: JsonlEventStore;
+      sessionStateStore?: SessionStateStore;
+      sessionMetadata?: PersistedSessionMetadata;
       contextBuilder: ContextBuilder;
       permissionManager: PermissionManager;
       toolExecutor: ToolExecutor;
@@ -104,6 +111,22 @@ export class AgentRuntime {
     return this.pendingApprovals.get(sessionId);
   }
 
+  async restorePersistedPending(sessionId: string): Promise<PendingApprovalSnapshot> {
+    const store = this.deps.sessionStateStore;
+    if (!store) throw new Error("resume_state_store_unavailable");
+    const persisted = await store.loadPending(sessionId);
+    if (!persisted) throw new Error("resume_state_not_found");
+    try {
+      await this.assertApprovalStateMatchesEvents(sessionId, persisted.pending.approvalId);
+    } catch (error) {
+      await store.clearPending(sessionId);
+      throw error;
+    }
+    const hydrated = hydratePendingApproval(persisted.pending);
+    this.pendingApprovals.set(sessionId, hydrated);
+    return hydrated;
+  }
+
   async resumeAfterApproval(request: ApprovalResumeRequest): Promise<TurnResult> {
     const pending = this.pendingApprovals.get(request.sessionId);
     if (!pending) {
@@ -120,34 +143,35 @@ export class AgentRuntime {
     }
 
     this.pendingApprovals.delete(request.sessionId);
-    await this.deps.eventStore.append({
-      type: "ApprovalResolved",
-      sessionId: request.sessionId,
-      approvalId: pending.approvalId,
-      resolution: request.resolution,
-    });
-    await this.deps.eventStore.append({
-      type: "TurnResumed",
-      sessionId: request.sessionId,
-      approvalId: pending.approvalId,
-      resumedFromCallId: pending.pendingCall.id,
-      remainingToolCallCount: pending.remainingToolCalls.length,
-    });
+    try {
+      let context = pending.context;
+      if (request.resolution === "allow") {
+        context = await this.executeApprovedCall(context, pending.pendingCall, pending.request.workspace);
+      } else {
+        context = await this.injectPermissionDenied(context, pending.pendingCall, request.sessionId);
+      }
 
-    let context = pending.context;
-    if (request.resolution === "allow") {
-      context = await this.executeApprovedCall(context, pending.pendingCall, pending.request.workspace);
-    } else {
-      context = await this.injectPermissionDenied(context, pending.pendingCall, request.sessionId);
+      const result = await this.continueTurn({
+        request: pending.request,
+        context,
+        iteration: pending.iteration,
+        pendingToolCalls: [...pending.remainingToolCalls],
+        memorySuggestions: [...pending.memorySuggestions],
+        resolvedApproval: {
+          approvalId: pending.approvalId,
+          resolution: request.resolution,
+          resumedFromCallId: pending.pendingCall.id,
+          remainingToolCallCount: pending.remainingToolCalls.length,
+        },
+      });
+      if (result.nextAction?.type !== "approval_required") {
+        await this.deps.sessionStateStore?.clearPending(request.sessionId);
+      }
+      return result;
+    } catch (error) {
+      this.pendingApprovals.set(request.sessionId, pending);
+      throw error;
     }
-
-    return await this.continueTurn({
-      request: pending.request,
-      context,
-      iteration: pending.iteration,
-      pendingToolCalls: [...pending.remainingToolCalls],
-      memorySuggestions: [...pending.memorySuggestions],
-    });
   }
 
   private async continueTurn(state: {
@@ -156,9 +180,16 @@ export class AgentRuntime {
     iteration: number;
     memorySuggestions: NonNullable<TurnResult["memorySuggestions"]>;
     pendingToolCalls?: ToolCall[];
+    resolvedApproval?: {
+      approvalId: string;
+      resolution: ApprovalResumeRequest["resolution"];
+      resumedFromCallId: string;
+      remainingToolCallCount: number;
+    };
   }): Promise<TurnResult> {
     let { request, context, memorySuggestions } = state;
     let queuedToolCalls = state.pendingToolCalls;
+    let resolvedApproval = state.resolvedApproval;
 
     for (let iteration = state.iteration; iteration < this.maxToolIterations; iteration += 1) {
       if (!queuedToolCalls) {
@@ -174,6 +205,7 @@ export class AgentRuntime {
 
         const response = await this.requestModel(context, request, memorySuggestions);
         if ("error" in response) {
+          await this.emitResolvedApprovalIfNeeded(request.sessionId, resolvedApproval);
           await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "model_error" });
           return {
             finalMessage: `Stopped: model error (${response.error.code}). ${summarizeProviderErrorCode(response.error.code)}`,
@@ -183,6 +215,7 @@ export class AgentRuntime {
           };
         }
         if (response.aborted) {
+          await this.emitResolvedApprovalIfNeeded(request.sessionId, resolvedApproval);
           return {
             finalMessage: `Stopped: aborted. ${abortReason(request.abortSignal?.reason)}`,
             finishReason: "aborted",
@@ -191,6 +224,7 @@ export class AgentRuntime {
           };
         }
         if (response.finalMessage !== undefined) {
+          await this.emitResolvedApprovalIfNeeded(request.sessionId, resolvedApproval);
           await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "final_message" });
           return {
             finalMessage: response.finalMessage,
@@ -230,6 +264,8 @@ export class AgentRuntime {
         }
 
         if (decision.kind === "ask") {
+          await this.emitResolvedApprovalIfNeeded(request.sessionId, resolvedApproval);
+          resolvedApproval = undefined;
           const approvalId = `approval-${call.id}`;
           const pending: PendingApprovalSnapshot = {
             approvalId,
@@ -250,6 +286,7 @@ export class AgentRuntime {
             toolName: call.name,
             remainingToolCallCount: remainingToolCalls.length,
           });
+          await this.persistPendingApproval(pending);
           return {
             finalMessage: "",
             nextAction: { type: "approval_required", approvalId, call, decision },
@@ -265,6 +302,7 @@ export class AgentRuntime {
       queuedToolCalls = undefined;
     }
 
+    await this.emitResolvedApprovalIfNeeded(request.sessionId, resolvedApproval);
     await this.deps.eventStore.append({ type: "AgentFinished", sessionId: request.sessionId, reason: "tool_iteration_limit" });
     return {
       finalMessage: "Stopped: tool iteration limit reached.",
@@ -272,6 +310,36 @@ export class AgentRuntime {
       events: await this.deps.eventStore.forSession(request.sessionId),
       memorySuggestions,
     };
+  }
+
+  private async persistPendingApproval(pending: PendingApprovalSnapshot): Promise<void> {
+    if (!this.deps.sessionStateStore || !this.deps.sessionMetadata) return;
+    await this.deps.sessionStateStore.savePending(serializePendingApproval(pending), this.deps.sessionMetadata);
+  }
+
+  private async emitResolvedApprovalIfNeeded(
+    sessionId: string,
+    resolvedApproval?: {
+      approvalId: string;
+      resolution: ApprovalResumeRequest["resolution"];
+      resumedFromCallId: string;
+      remainingToolCallCount: number;
+    },
+  ): Promise<void> {
+    if (!resolvedApproval) return;
+    await this.deps.eventStore.append({
+      type: "ApprovalResolved",
+      sessionId,
+      approvalId: resolvedApproval.approvalId,
+      resolution: resolvedApproval.resolution,
+    });
+    await this.deps.eventStore.append({
+      type: "TurnResumed",
+      sessionId,
+      approvalId: resolvedApproval.approvalId,
+      resumedFromCallId: resolvedApproval.resumedFromCallId,
+      remainingToolCallCount: resolvedApproval.remainingToolCallCount,
+    });
   }
 
   private async requestModel(
@@ -452,6 +520,60 @@ export class AgentRuntime {
     });
     return next;
   }
+
+  private async assertApprovalStateMatchesEvents(sessionId: string, approvalId: string): Promise<void> {
+    const events = await this.deps.eventStore.forSession(sessionId);
+    const approvalEvents = events.filter(
+      (event) => event.type === "ApprovalPending" || event.type === "ApprovalResolved" || event.type === "TurnResumed",
+    );
+    const latestApprovalEvent = approvalEvents.at(-1);
+    if (!latestApprovalEvent || latestApprovalEvent.type !== "ApprovalPending") {
+      throw new Error("resume_state_mismatch");
+    }
+    if (latestApprovalEvent.approvalId !== approvalId) {
+      throw new Error("resume_state_mismatch");
+    }
+    const pendingSequence = latestApprovalEvent.sequence;
+    const hasLaterResolution = approvalEvents.some(
+      (event) =>
+        event.sequence > pendingSequence &&
+        ((event.type === "ApprovalResolved" && event.approvalId === approvalId) ||
+          (event.type === "TurnResumed" && event.approvalId === approvalId)),
+    );
+    if (hasLaterResolution) {
+      throw new Error("resume_state_mismatch");
+    }
+  }
+}
+
+function serializePendingApproval(pending: PendingApprovalSnapshot): PersistedPendingApprovalSnapshot {
+  return {
+    approvalId: pending.approvalId,
+    sessionId: pending.request.sessionId,
+    context: pending.context,
+    iteration: pending.iteration,
+    pendingCall: pending.pendingCall,
+    remainingToolCalls: pending.remainingToolCalls,
+    memorySuggestions: pending.memorySuggestions,
+    decision: pending.decision,
+    workspace: pending.request.workspace,
+  };
+}
+
+function hydratePendingApproval(snapshot: PersistedPendingApprovalSnapshot): PendingApprovalSnapshot {
+  return {
+    approvalId: snapshot.approvalId,
+    request: {
+      sessionId: snapshot.sessionId,
+      workspace: snapshot.workspace,
+    },
+    context: snapshot.context,
+    iteration: snapshot.iteration,
+    pendingCall: snapshot.pendingCall,
+    remainingToolCalls: snapshot.remainingToolCalls,
+    memorySuggestions: snapshot.memorySuggestions,
+    decision: snapshot.decision,
+  };
 }
 
 function abortReason(reason: unknown): string {

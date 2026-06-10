@@ -7,10 +7,19 @@ import { JsonlEventStore } from "./events.ts";
 import { createModelAdapter, probeProviderCompatibility } from "./models.ts";
 import { PermissionManager } from "./permissions.ts";
 import { AgentRuntime } from "./runtime.ts";
+import { FileSessionStateStore } from "./session-state.ts";
 import { ToolExecutor } from "./tools.ts";
-import type { AgentCliExecutionResult, AgentCliOptions, ModelAdapter, TurnRequest, TurnResult } from "./types.ts";
+import type {
+  AgentCliExecutionResult,
+  AgentCliOptions,
+  ModelAdapter,
+  ResumeCandidate,
+  SessionStateStore,
+  TurnRequest,
+  TurnResult,
+} from "./types.ts";
 
-type AgentRuntimeLike = Pick<AgentRuntime, "runTurn" | "resumeAfterApproval" | "getPendingApproval">;
+type AgentRuntimeLike = Pick<AgentRuntime, "runTurn" | "resumeAfterApproval" | "getPendingApproval" | "restorePersistedPending">;
 
 type ReplIo = {
   readLine(): Promise<string | undefined>;
@@ -58,6 +67,7 @@ export async function executeAgentCli(
     io?: ReplIo;
     runtimeFactory?: (options: AgentCliOptions, model: ModelAdapter) => AgentRuntimeLike;
     modelAdapterFactory?: (config: { provider: "openai" | "anthropic"; model: string; baseUrl?: string }) => ModelAdapter;
+    sessionStateStoreFactory?: (options: AgentCliOptions) => SessionStateStore;
     sessionIdFactory?: () => string;
   } = {},
 ): Promise<AgentCliExecutionResult> {
@@ -92,35 +102,55 @@ export async function runAgentRepl(
     io?: ReplIo;
     runtimeFactory?: (options: AgentCliOptions, model: ModelAdapter) => AgentRuntimeLike;
     modelAdapterFactory?: (config: { provider: "openai" | "anthropic"; model: string; baseUrl?: string }) => ModelAdapter;
+    sessionStateStoreFactory?: (options: AgentCliOptions) => SessionStateStore;
     sessionIdFactory?: () => string;
   } = {},
 ): Promise<{ exitCode: number; sessionId: string }> {
-  const sessionId = options.sessionId ?? deps.sessionIdFactory?.() ?? crypto.randomUUID();
   const io = deps.io ?? createReadlineIo();
-  const cwd = options.cwd;
+  let currentOptions: AgentCliOptions = {
+    ...options,
+    sessionId: options.sessionId ?? deps.sessionIdFactory?.() ?? crypto.randomUUID(),
+  };
   let runtime: AgentRuntimeLike | undefined;
   let adapter: ModelAdapter | undefined;
+  let sessionStateStore: SessionStateStore | undefined;
+
+  function currentEventStorePath(): string {
+    return currentOptions.eventStorePath ?? join(currentOptions.cwd, ".events.jsonl");
+  }
 
   function getAdapter(): ModelAdapter {
     adapter ??= (deps.modelAdapterFactory ?? ((config) => createModelAdapter(config)))({
-      provider: options.provider,
-      model: options.model,
-      baseUrl: options.baseUrl,
+      provider: currentOptions.provider,
+      model: currentOptions.model,
+      baseUrl: currentOptions.baseUrl,
     });
     return adapter;
   }
 
+  function getSessionStateStore(): SessionStateStore {
+    sessionStateStore ??= (deps.sessionStateStoreFactory ?? ((replOptions) => new FileSessionStateStore(join(replOptions.cwd, ".agent-session-state"))))(currentOptions);
+    return sessionStateStore;
+  }
+
   function getRuntime(): AgentRuntimeLike {
     runtime ??= deps.runtimeFactory
-      ? deps.runtimeFactory(options, {
+      ? deps.runtimeFactory(currentOptions, {
           provider: "fake",
           model: "runtime-factory-placeholder",
           async complete() {
             return { finalMessage: "" };
           },
         })
-      : createRuntime(options, getAdapter());
+      : createRuntime(currentOptions, getAdapter(), getSessionStateStore());
     return runtime;
+  }
+
+  function switchActiveSession(nextOptions: AgentCliOptions): void {
+    currentOptions = nextOptions;
+    runtime = undefined;
+    adapter = undefined;
+    sessionStateStore = undefined;
   }
 
   writeChannel(io, "system", renderWelcome());
@@ -139,13 +169,60 @@ export async function runAgentRepl(
     if (trimmed === "/status") {
       io.write(
         renderStatus({
-          provider: options.provider,
-          model: options.model,
-          sessionId,
-          cwd,
-          pendingApproval: runtime?.getPendingApproval(sessionId)?.approvalId,
+          provider: currentOptions.provider,
+          model: currentOptions.model,
+          sessionId: currentOptions.sessionId ?? "unknown",
+          cwd: currentOptions.cwd,
+          eventStorePath: currentEventStorePath(),
+          baseUrl: currentOptions.baseUrl,
+          pendingApproval: runtime?.getPendingApproval(currentOptions.sessionId ?? "")?.approvalId,
         }),
       );
+      continue;
+    }
+    if (trimmed === "/resume") {
+      const candidates = await getSessionStateStore().listPending();
+      io.write(renderResumeCandidates(candidates));
+      continue;
+    }
+    if (trimmed.startsWith("/resume ")) {
+      const selection = trimmed.slice("/resume ".length).trim();
+      const candidates = await getSessionStateStore().listPending();
+      const target = resolveResumeCandidate(candidates, selection);
+      if (!target) {
+        writeChannel(io, "assistant", "resume_session_not_found");
+        continue;
+      }
+      const activeSessionId = currentOptions.sessionId ?? "";
+      const activePending = runtime?.getPendingApproval(activeSessionId);
+      if (activePending && target.sessionId !== activeSessionId) {
+        writeChannel(io, "assistant", "cannot_switch_pending_session");
+        continue;
+      }
+      const previousOptions = currentOptions;
+      const previousRuntime = runtime;
+      const previousAdapter = adapter;
+      const previousStore = sessionStateStore;
+      switchActiveSession({
+        provider: target.metadata.provider,
+        model: target.metadata.model,
+        cwd: target.metadata.cwd,
+        sessionId: target.sessionId,
+        eventStorePath: target.metadata.eventStorePath,
+        allowEdits: target.metadata.allowEdits,
+        baseUrl: target.metadata.baseUrl,
+      });
+      try {
+        const restored = await getRuntime().restorePersistedPending(target.sessionId);
+        writeChannel(io, "local", `Restored pending approval for session ${target.sessionId}.`);
+        io.write(renderApprovalRequired(restored.approvalId, restored.pendingCall.name, restored.pendingCall.input));
+      } catch (error) {
+        currentOptions = previousOptions;
+        runtime = previousRuntime;
+        adapter = previousAdapter;
+        sessionStateStore = previousStore;
+        writeChannel(io, "assistant", normalizeCliError(error));
+      }
       continue;
     }
     if (trimmed === "/diagnose-provider") {
@@ -154,39 +231,49 @@ export async function runAgentRepl(
     }
     if (trimmed === "/allow" || trimmed === "/deny") {
       const activeRuntime = getRuntime();
-      const pending = activeRuntime.getPendingApproval(sessionId);
+      const activeSessionId = currentOptions.sessionId ?? "unknown";
+      const pending = activeRuntime.getPendingApproval(activeSessionId);
       const result = await activeRuntime.resumeAfterApproval({
-        sessionId,
-        approvalId: pending?.approvalId ?? `approval-missing-${sessionId}`,
+        sessionId: activeSessionId,
+        approvalId: pending?.approvalId ?? `approval-missing-${activeSessionId}`,
         resolution: trimmed === "/allow" ? "allow" : "deny",
       });
       writeTurnResult(io, result);
       continue;
     }
 
-    const localPackageScripts = await maybeAnswerPackageScriptsLocally(trimmed, cwd);
+    const localPackageScripts = await maybeAnswerPackageScriptsLocally(trimmed, currentOptions.cwd);
     if (localPackageScripts) {
       writeChannel(io, "local", localPackageScripts);
       continue;
     }
 
     const result = await getRuntime().runTurn({
-      sessionId,
+      sessionId: currentOptions.sessionId ?? "unknown",
       userMessage: trimmed,
-      workspace: { cwd },
+      workspace: { cwd: currentOptions.cwd },
     } satisfies TurnRequest);
     writeTurnResult(io, result);
   }
 
   io.close?.();
-  return { exitCode: 0, sessionId };
+  return { exitCode: 0, sessionId: currentOptions.sessionId ?? "unknown" };
 }
 
-function createRuntime(options: AgentCliOptions, model: ModelAdapter): AgentRuntime {
+function createRuntime(options: AgentCliOptions, model: ModelAdapter, sessionStateStore: SessionStateStore): AgentRuntime {
   const eventStorePath = options.eventStorePath ?? join(options.cwd, ".events.jsonl");
   return new AgentRuntime({
     model,
     eventStore: new JsonlEventStore(eventStorePath),
+    sessionStateStore,
+    sessionMetadata: {
+      provider: options.provider,
+      model: options.model,
+      cwd: options.cwd,
+      eventStorePath,
+      allowEdits: options.allowEdits,
+      baseUrl: options.baseUrl,
+    },
     contextBuilder: new ContextBuilder(),
     permissionManager: new PermissionManager({ allowEdits: options.allowEdits }),
     toolExecutor: new ToolExecutor(),
@@ -212,6 +299,7 @@ function renderHelp(): string {
     "Commands:",
     "/help              Show available commands",
     "/status            Show current session state",
+    "/resume [target]   List or restore a persisted pending session",
     "/diagnose-provider Probe basic text and tool-call compatibility",
     "/allow             Approve the pending tool action",
     "/deny              Reject the pending tool action",
@@ -224,6 +312,8 @@ function renderStatus(state: {
   model: string;
   sessionId: string;
   cwd: string;
+  eventStorePath: string;
+  baseUrl?: string;
   pendingApproval?: string;
 }): string {
   return [
@@ -232,6 +322,8 @@ function renderStatus(state: {
     `model: ${state.model}`,
     `session_id: ${state.sessionId}`,
     `cwd: ${state.cwd}`,
+    `event_store_path: ${state.eventStorePath}`,
+    `base_url: ${state.baseUrl ?? "default"}`,
     `pending_approval: ${state.pendingApproval ?? "none"}`,
   ].join("\n") + "\n";
 }
@@ -241,6 +333,24 @@ function renderProviderDiagnosis(report: { summary: string; details: string[] })
     "[diagnostics] Provider diagnosis",
     `summary: ${report.summary}`,
     ...report.details,
+  ].join("\n") + "\n";
+}
+
+function renderResumeCandidates(candidates: ResumeCandidate[]): string {
+  if (candidates.length === 0) return "[local] Resumable sessions: none\n";
+  return [
+    "[local] Resumable sessions:",
+    ...candidates.map((candidate, index) =>
+      [
+        `${index + 1}. ${candidate.sessionId}`,
+        `   provider: ${candidate.metadata.provider}`,
+        `   model: ${candidate.metadata.model}`,
+        `   cwd: ${candidate.metadata.cwd}`,
+        `   base_url: ${candidate.metadata.baseUrl ?? "default"}`,
+        `   tool: ${candidate.toolName}`,
+        `   updated_at: ${candidate.updatedAt}`,
+      ].join("\n"),
+    ),
   ].join("\n") + "\n";
 }
 
@@ -287,6 +397,14 @@ function normalizeCliError(error: unknown): string {
 
 function writeChannel(io: ReplIo, channel: OutputChannel, text: string): void {
   io.write(`[${channel}] ${text}\n`);
+}
+
+function resolveResumeCandidate(candidates: ResumeCandidate[], selection: string): ResumeCandidate | undefined {
+  if (/^\d+$/.test(selection)) {
+    const index = Number.parseInt(selection, 10) - 1;
+    return candidates[index];
+  }
+  return candidates.find((candidate) => candidate.sessionId === selection);
 }
 
 function renderApprovalRequired(approvalId: string, toolName: string, input: Record<string, unknown>): string {

@@ -321,6 +321,48 @@ export interface PendingApprovalSnapshot {
   decision: PermissionDecision;
 }
 
+export interface PersistedPendingApprovalSnapshot {
+  approvalId: string;
+  sessionId: string;
+  context: ContextBundle;
+  iteration: number;
+  pendingCall: ToolCall;
+  remainingToolCalls: ToolCall[];
+  memorySuggestions: MemoryWriteSuggestion[];
+  decision: PermissionDecision;
+  workspace: WorkspacePolicy;
+}
+
+export interface PersistedSessionMetadata {
+  provider: "openai" | "anthropic";
+  model: string;
+  cwd: string;
+  eventStorePath: string;
+  allowEdits: boolean;
+  baseUrl?: string;
+}
+
+export interface PersistedSessionState {
+  updatedAt: string;
+  metadata: PersistedSessionMetadata;
+  pending: PersistedPendingApprovalSnapshot;
+}
+
+export interface ResumeCandidate {
+  sessionId: string;
+  approvalId: string;
+  toolName: string;
+  updatedAt: string;
+  metadata: PersistedSessionMetadata;
+}
+
+export interface SessionStateStore {
+  savePending(snapshot: PersistedPendingApprovalSnapshot, metadata: PersistedSessionMetadata): Promise<void>;
+  listPending(): Promise<ResumeCandidate[]>;
+  loadPending(sessionId: string): Promise<PersistedSessionState | undefined>;
+  clearPending(sessionId: string): Promise<void>;
+}
+
 export interface ModelAdapter {
   readonly provider?: string;
   readonly model?: string;

@@ -405,3 +405,204 @@ test("runAgentRepl can answer the package.json scripts request locally without c
   assert.equal(adapterCalls, 0);
   assert.match(output(), /\[local\] npm scripts: test, agent, memory, memory:tui/);
 });
+
+test("runAgentRepl can list and resume a persisted pending session, then switch active status to restored metadata", async () => {
+  const cwd = await workspace();
+  const eventStorePath = join(cwd, ".events.jsonl");
+  const { AgentRuntime, ContextBuilder, FileSessionStateStore, JsonlEventStore, PermissionManager, ToolExecutor } = await import("../src/index.ts");
+  const sessionStateStore = new FileSessionStateStore(join(cwd, ".agent-session-state"));
+
+  const seedRuntime = new AgentRuntime({
+    model: {
+      async complete(): Promise<ModelResponse> {
+        return {
+          toolCalls: [{ id: "call-edit-resume-cli", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } }],
+        };
+      },
+    },
+    eventStore: new JsonlEventStore(eventStorePath),
+    sessionStateStore,
+    sessionMetadata: {
+      provider: "openai",
+      model: "gpt-5-mini",
+      cwd,
+      eventStorePath,
+      allowEdits: false,
+      baseUrl: "https://example.test/v1",
+    },
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  });
+  await seedRuntime.runTurn({
+    sessionId: "session-cli-resume",
+    userMessage: "edit notes",
+    workspace: { cwd },
+  });
+
+  const { io, output } = createIo(["/resume", "/resume 1", "/status", "/allow", "/exit"]);
+
+  const result = await runAgentRepl(
+    {
+      provider: "anthropic",
+      model: "claude-sonnet-test",
+      cwd,
+      sessionId: "fresh-session",
+      eventStorePath,
+      allowEdits: false,
+    },
+    {
+      io,
+      modelAdapterFactory() {
+        return {
+          provider: "fake",
+          model: "fake-restored",
+          async complete(): Promise<ModelResponse> {
+            return { finalMessage: "restored continuation complete" };
+          },
+        };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(output(), /\[local\] Resumable sessions:/);
+  assert.match(output(), /1\. session-cli-resume/);
+  assert.match(output(), /base_url: https:\/\/example\.test\/v1/);
+  assert.match(output(), /\[local\] Restored pending approval for session session-cli-resume\./);
+  assert.match(output(), /session_id: session-cli-resume/);
+  assert.match(output(), /provider: openai/);
+  assert.match(output(), /model: gpt-5-mini/);
+  assert.match(output(), /base_url: https:\/\/example\.test\/v1/);
+  assert.match(output(), /\[assistant\] restored continuation complete/);
+});
+
+test("runAgentRepl rejects switching to another persisted session while the active session still has pending approval", async () => {
+  const cwd = await workspace();
+  const eventStorePath = join(cwd, ".events.jsonl");
+  const { AgentRuntime, ContextBuilder, FileSessionStateStore, JsonlEventStore, PermissionManager, ToolExecutor } = await import("../src/index.ts");
+  const sessionStateStore = new FileSessionStateStore(join(cwd, ".agent-session-state"));
+
+  for (const sessionId of ["session-one", "session-two"]) {
+    const seedRuntime = new AgentRuntime({
+      model: {
+        async complete(): Promise<ModelResponse> {
+          return {
+            toolCalls: [{ id: `call-${sessionId}`, name: "edit_file", input: { path: "notes.txt", content: `${sessionId}\n` } }],
+          };
+        },
+      },
+      eventStore: new JsonlEventStore(eventStorePath),
+      sessionStateStore,
+      sessionMetadata: {
+        provider: "openai",
+        model: "gpt-5-mini",
+        cwd,
+        eventStorePath,
+        allowEdits: false,
+        baseUrl: "https://example.test/v1",
+      },
+      contextBuilder: new ContextBuilder(),
+      permissionManager: new PermissionManager(),
+      toolExecutor: new ToolExecutor(),
+    });
+    await seedRuntime.runTurn({
+      sessionId,
+      userMessage: "edit notes",
+      workspace: { cwd },
+    });
+  }
+
+  const { io, output } = createIo(["/resume 1", "/resume 2", "/exit"]);
+
+  const result = await runAgentRepl(
+    {
+      provider: "openai",
+      model: "gpt-5-mini",
+      cwd,
+      sessionId: "fresh-session",
+      eventStorePath,
+      allowEdits: false,
+    },
+    {
+      io,
+      modelAdapterFactory() {
+        return {
+          provider: "fake",
+          model: "fake-restored",
+          async complete(): Promise<ModelResponse> {
+            return { finalMessage: "unused" };
+          },
+        };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(output(), /\[local\] Restored pending approval for session session-one\./);
+  assert.match(output(), /\[assistant\] cannot_switch_pending_session/);
+});
+
+test("runAgentRepl can restore a persisted session directly by sessionId", async () => {
+  const cwd = await workspace();
+  const eventStorePath = join(cwd, ".events.jsonl");
+  const { AgentRuntime, ContextBuilder, FileSessionStateStore, JsonlEventStore, PermissionManager, ToolExecutor } = await import("../src/index.ts");
+  const sessionStateStore = new FileSessionStateStore(join(cwd, ".agent-session-state"));
+
+  const seedRuntime = new AgentRuntime({
+    model: {
+      async complete(): Promise<ModelResponse> {
+        return {
+          toolCalls: [{ id: "call-edit-direct-resume", name: "edit_file", input: { path: "notes.txt", content: "changed\n" } }],
+        };
+      },
+    },
+    eventStore: new JsonlEventStore(eventStorePath),
+    sessionStateStore,
+    sessionMetadata: {
+      provider: "openai",
+      model: "gpt-5-mini",
+      cwd,
+      eventStorePath,
+      allowEdits: false,
+      baseUrl: "https://example.test/v1",
+    },
+    contextBuilder: new ContextBuilder(),
+    permissionManager: new PermissionManager(),
+    toolExecutor: new ToolExecutor(),
+  });
+  await seedRuntime.runTurn({
+    sessionId: "session-direct-resume",
+    userMessage: "edit notes",
+    workspace: { cwd },
+  });
+
+  const { io, output } = createIo(["/resume session-direct-resume", "/allow", "/exit"]);
+
+  const result = await runAgentRepl(
+    {
+      provider: "openai",
+      model: "gpt-5-mini",
+      cwd,
+      sessionId: "fresh-session",
+      eventStorePath,
+      allowEdits: false,
+    },
+    {
+      io,
+      modelAdapterFactory() {
+        return {
+          provider: "fake",
+          model: "fake-restored",
+          async complete(): Promise<ModelResponse> {
+            return { finalMessage: "direct session restore complete" };
+          },
+        };
+      },
+    },
+  );
+
+  assert.equal(result.exitCode, 0);
+  assert.match(output(), /\[local\] Restored pending approval for session session-direct-resume\./);
+  assert.match(output(), /\[assistant\] direct session restore complete/);
+});

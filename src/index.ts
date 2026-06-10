@@ -10,3 +10,4 @@ export * from "./permissions.ts";
 export * from "./tools.ts";
 export * from "./runtime.ts";
 export * from "./replay.ts";
+export * from "./session-state.ts";
